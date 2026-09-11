@@ -1,121 +1,63 @@
 # Flash Sale Inventory System
 
-> Laravel 11 hiring assessment implementation — a concurrent, queue-driven
-> inventory system that survives thousands of purchase requests against a
-> limited stock pool without ever overselling.
+A Laravel 11 + MySQL + Docker implementation of the *Flash Sale Inventory* hiring test.
+The codebase focuses on **concurrency-safe stock control**, a clean **service-layer
+architecture**, and **observability** (activity log + queue + atomic SQL).
 
-[![Laravel](https://img.shields.io/badge/Laravel-11.31-FF2D20?logo=laravel)](https://laravel.com)
-[![PHP](https://img.shields.io/badge/PHP-8.2%2B-777BB4?logo=php)](https://php.net)
-[![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql)](https://www.mysql.com)
-[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)](https://www.docker.com)
+> **Stack:** PHP 8.4 · Laravel 11.31 · MySQL 8.0 · Docker Compose · Database queue
 
 ---
 
 ## Table of Contents
-1. [System Architecture](#1-system-architecture)
-2. [Key Design Decisions](#2-key-design-decisions)
-3. [Concurrency — How Overselling is Prevented](#3-concurrency--how-overselling-is-prevented)
-4. [Folder Structure](#4-folder-structure)
-5. [Prerequisites](#5-prerequisites)
-6. [Quick Start](#6-quick-start)
-7. [API Contract](#7-api-contract)
-8. [Service Endpoints](#8-service-endpoints)
-9. [Database Schema](#9-database-schema)
-10. [Configuration](#10-configuration)
-11. [Testing & Verification](#11-testing--verification)
-12. [Implementation Walkthrough](#12-implementation-walkthrough)
+
+1. [Architecture](#1-architecture)
+2. [Prerequisites](#2-prerequisites)
+3. [Step-by-Step Setup](#3-step-by-step-setup)
+4. [Environment Variables (`.env`)](#4-environment-variables-env)
+5. [Database Schema](#5-database-schema)
+6. [REST API Reference](#6-rest-api-reference)
+7. [Verification: Expected Results](#7-verification-expected-results)
+8. [Concurrency & Discount Simulations](#8-concurrency--discount-simulations)
+9. [Project Layout](#9-project-layout)
+10. [Design Decisions & Trade-offs](#10-design-decisions--trade-offs)
 
 ---
 
-## 1. System Architecture
+## 1. Architecture
 
 ### 1.1 High-Level Container Topology
 
 ```mermaid
 flowchart LR
-    subgraph Host["Developer Machine (Windows)"]
-        subgraph DC["Docker Compose Network (flash_sale_net)"]
-            APP["app<br/>PHP-FPM 8.4<br/>:8000"]
-            WORKER["worker<br/>queue:work"]
-            SCHED["scheduler<br/>schedule:work"]
-            DB["db<br/>MySQL 8.0<br/>:3306"]
-            VOL[("dbdata<br/>volume")]
+    subgraph Host["Developer Machine (Windows / macOS / Linux)"]
+        subgraph Net["Docker Network: flash_sale_net"]
+            APP["app<br/>PHP-FPM 8.4<br/>Nginx: 8000"]
+            WORKER["worker<br/>php artisan queue:work"]
+            DB[("db<br/>MySQL 8.0<br/>:3306")]
         end
+        VOL[("dbdata<br/>named volume")]
         BROWSER["Browser<br/>(Blade UI)"]
-        CURL["curl / Postman<br/>(API client)"]
+        CURL["curl / Postman / httpie"]
     end
 
     BROWSER -->|"HTTP :8000"| APP
     CURL    -->|"HTTP :8000/api"| APP
     APP     -->|"SQL :3306"| DB
-    WORKER  -->|"SQL :3306"| DB
-    SCHED   -->|"SQL :3306"| DB
-    DB --- VOL
-    APP -. "dispatch() .->" . WORKER
+    WORKER  -->|"poll jobs table"| DB
+    DB      --- VOL
 ```
 
-### 1.2 Request Flow — The Purchase Pipeline
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client (curl / Browser)
-    participant PC as PurchaseController<br/>(thin)
-    participant PS as PurchaseService<br/>(domain)
-    participant Cache as Cache (file)
-    participant DB as MySQL 8.0
-    participant JQ as ProcessOrder Job
-    participant AL as ActivityLog
-
-    C->>PC: POST /api/purchase<br/>{ sku, quantity }<br/>X-User-Email: alice@x
-    PC->>PC: PurchaseRequest::validate()
-    PC->>PS: attempt(email, sku, qty)
-
-    PS->>Cache: get("cooldown:alice@x:SKU-1001")
-    alt cache HIT
-        PS-->>PC: throw PurchaseCooldownException
-        PC-->>C: 429 Too Many Requests
-    end
-
-    PS->>DB: BEGIN TRANSACTION
-    PS->>DB: SELECT product FOR UPDATE
-    alt product inactive
-        PS-->>PC: throw InactiveProductException
-        PC-->>C: 400 Bad Request
-    end
-    PS->>DB: UPDATE products<br/>SET stock = stock - qty<br/>WHERE stock >= qty AND status='active'
-    alt affectedRows == 0
-        PS-->>PC: throw InsufficientStockException
-        PC-->>C: 400 Bad Request
-    end
-
-    PS->>PS: DiscountService::roll()
-    PS->>DB: INSERT INTO orders (..., status='pending')
-    PS->>DB: COMMIT
-    PS->>Cache: put("cooldown:...", true, 60s)
-    PS->>AL: INSERT INTO activity_logs (success)
-    PS->>JQ: dispatch(ProcessOrder(order))
-
-    PS-->>PC: PurchaseResult(success, order, discount, payable)
-    PC-->>C: 200 OK<br/>{ success, order_id, discount, payable, invoice:PENDING }
-    Note over JQ,DB: Async — generates invoice<br/>and marks order COMPLETED
-    JQ->>DB: UPDATE orders<br/>SET invoice_number, status='completed'
-    JQ->>AL: (no further log)
-```
-
-### 1.3 Layered Architecture (Thin Controllers)
+### 1.2 Layered Architecture (Thin Controllers)
 
 ```mermaid
 flowchart TB
     subgraph Presentation["Presentation Layer (HTTP)"]
-        CTRL["Controllers<br/>(thin — orchestration only)"]
+        CTRL["Controllers<br/>(thin, orchestration only)"]
         REQ["FormRequests<br/>(validation rules)"]
-        RES["Resources<br/>(JSON shaping)"]
     end
     subgraph Domain["Domain / Service Layer (Business Logic)"]
         PS["PurchaseService<br/>attempt()"]
         DS["DiscountService<br/>roll()"]
-        OS["OrderService"]
     end
     subgraph Persistence["Persistence Layer (Eloquent)"]
         MOD["Models<br/>Product, Order, ActivityLog"]
@@ -123,478 +65,446 @@ flowchart TB
     end
     subgraph Async["Async Layer"]
         JOB["ProcessOrder Job"]
-    end
-    subgraph Data["Data Store"]
-        MYSQL["MySQL 8.0"]
+        Q[("jobs table<br/>(DB queue)")]
     end
 
     CTRL --> REQ
     CTRL --> PS
     PS --> DS
-    PS --> OS
     PS --> MOD
     PS --> EXC
-    CTRL --> RES
-    OS --> JOB
-    MOD --> MYSQL
-    JOB --> MOD
+    PS --> JOB
+    JOB --> Q
 ```
 
-> **Why this matters:** the same `PurchaseService::attempt()` is invoked by the
-> HTTP controller *and* the concurrency-simulation command. Business logic has a
-> single source of truth and zero duplication.
+### 1.3 Purchase Request Flow
 
----
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant PC as PurchaseController
+    participant PS as PurchaseService
+    participant Cache
+    participant DB as MySQL
+    participant Q as Queue
 
-## 2. Key Design Decisions
-
-| # | Decision | Rationale |
-|---|----------|-----------|
-| 1 | **Atomic conditional UPDATE** for stock decrement (`UPDATE ... WHERE stock >= qty`) | Single-statement correctness — no race window. MySQL guarantees only one concurrent UPDATE wins per row. |
-| 2 | **Database transactions** wrap stock decrement + order creation | If order creation fails, the stock change rolls back. |
-| 3 | **Cache-based cooldown** keyed by `purchase_cooldown:{email}:{sku}` | TTL is a native fit; no schema writes per request. |
-| 4 | **Service layer + thin controllers** | Reusable from CLI (concurrency tests), testable in isolation, no duplication. |
-| 5 | **Database queue driver** | Zero extra infrastructure; persists across restarts; integrates natively with `failed_jobs`. |
-| 6 | **Custom Exceptions** (`InsufficientStockException`, `InactiveProductException`, `PurchaseCooldownException`, `ProductNotFoundException`) | Controller maps each to an HTTP status with a single `match()` block. Service has no HTTP knowledge. |
-| 7 | **Mystery Discount rolled synchronously** at order creation | Discount + final payable are persisted *before* the job dispatches, so even if the job fails the user sees what they were charged. |
-| 8 | **Activity Log on every branch** — including cooldown and validation rejections | Gives operators a full audit trail. |
-| 9 | **`final readonly class PurchaseResult`** | Controllers can't accidentally mutate the result; JSON shape is centralized. |
-| 10 | **All services bind to interfaces** via `AppServiceProvider` | Easy to mock in unit tests; swappable if logic moves to Postgres or an external API. |
-
----
-
-## 3. Concurrency — How Overselling is Prevented
-
-The **single-statement conditional UPDATE** is the cornerstone. Here is the
-excerpt from `app/Services/PurchaseService.php`:
-
-```php
-$affected = Product::query()
-    ->where('id', $product->id)
-    ->where('status', ProductStatus::Active)
-    ->where('stock_quantity', '>=', $quantity)
-    ->update([
-        'stock_quantity' => DB::raw("stock_quantity - {$quantity}"),
-    ]);
-
-if ($affected === 0) {
-    throw new InsufficientStockException();
-}
-```
-
-### Why this is correct
-
-1. **MySQL serializes writes** on a given row — concurrent `UPDATE` statements
-   on the same row are queued and executed one after another.
-2. The `WHERE stock_quantity >= $quantity` predicate is evaluated *atomically*
-   with the write, so if a competing request has already reduced the stock
-   below the threshold, our update affects 0 rows.
-3. The transaction wrapping this update guarantees that if the subsequent
-   `INSERT INTO orders` fails, the stock decrement rolls back.
-
-### Verification (proof, not just theory)
-
-The `purchase:simulate` command fires N parallel HTTP requests against one SKU.
-With **stock = 5** and **10 users each requesting qty = 2**:
-
-```text
-Starting stock:     5
-Successful:         2
-Failed (stock):     8
-Final stock:        1
-Expected:           1  (5 - 2*2)
-✅ PASS: No overselling. Stock and orders are consistent.
-```
-
-The atomic UPDATE guarantees that no matter how many requests arrive in
-parallel, **at most ⌊stock / qty⌋** will succeed. The remaining requests see
-`affectedRows == 0` and cleanly return `400 Insufficient stock`.
-
----
-
-## 4. Folder Structure
-
-```text
-Flash_Sale_Inventor_System/
-├── docker/
-│   ├── nginx/
-│   │   └── default.conf
-│   └── php/
-│       └── Dockerfile                  # PHP 8.4-cli + all Laravel extensions
-│
-├── docker-compose.yml                  # app + worker + scheduler + db
-├── .dockerignore
-├── .env.example
-│
-├── app/
-│   ├── Console/
-│   │   └── Commands/
-│   │       └── SimulateConcurrentPurchasesCommand.php
-│   │
-│   ├── Enums/
-│   │   ├── ProductStatus.php           # Active / Inactive
-│   │   ├── OrderStatus.php             # Pending / Completed / Failed
-│   │   └── ActivityStatus.php          # Success / Failed
-│   │
-│   ├── Exceptions/
-│   │   ├── InsufficientStockException.php
-│   │   ├── InactiveProductException.php
-│   │   ├── PurchaseCooldownException.php
-│   │   └── ProductNotFoundException.php
-│   │
-│   ├── Http/
-│   │   ├── Controllers/
-│   │   │   ├── ProductController.php
-│   │   │   └── Api/
-│   │   │       └── PurchaseController.php   # 30 lines — pure delegation
-│   │   └── Requests/
-│   │       ├── StoreProductRequest.php
-│   │       ├── UpdateProductRequest.php
-│   │       └── PurchaseRequest.php
-│   │
-│   ├── Jobs/
-│   │   └── ProcessOrder.php            # Generates invoice, marks completed
-│   │
-│   ├── Models/
-│   │   ├── Product.php
-│   │   ├── Order.php
-│   │   └── ActivityLog.php
-│   │
-│   ├── Providers/
-│   │   └── AppServiceProvider.php      # Binds service interfaces
-│   │
-│   ├── Services/
-│   │   ├── Contracts/                  # Interfaces
-│   │   │   ├── PurchaseServiceInterface.php
-│   │   │   ├── DiscountServiceInterface.php
-│   │   │   └── OrderServiceInterface.php
-│   │   ├── DiscountService.php         # 20% / 5% / 75% mystery discount
-│   │   ├── OrderService.php            # Status transitions
-│   │   └── PurchaseService.php         # ⭐ Core purchase orchestration
-│   │
-│   └── Support/
-│       └── PurchaseResult.php          # Immutable result DTO
-│
-├── database/
-│   ├── migrations/
-│   │   ├── 2026_09_11_000001_create_products_table.php
-│   │   ├── 2026_09_11_000002_create_orders_table.php
-│   │   └── 2026_09_11_000003_create_activity_logs_table.php
-│   └── seeders/
-│       ├── DatabaseSeeder.php
-│       └── ProductSeeder.php
-│
-├── routes/
-│   ├── api.php
-│   ├── web.php
-│   └── console.php
-│
-├── resources/views/products/
-│   ├── index.blade.php
-│   ├── create.blade.php
-│   └── edit.blade.php
-│
-├── tests/
-│   └── smoke-api.sh                    # 8 black-box API scenarios
-│
-├── composer.json
-├── artisan
-└── README.md                           # ← this file
+    C->>PC: POST /api/purchase {sku, quantity}
+    PC->>PS: attempt(email, sku, qty)
+    PS->>Cache: has("cooldown:{email}:{sku}")?
+    alt Cooldown active
+        Cache-->>PS: true
+        PS-->>PC: PurchaseCooldownException
+        PC-->>C: 429 Too Many Requests
+    else Cache miss
+        Cache-->>PS: false
+        PS->>DB: BEGIN
+        PS->>DB: UPDATE products SET stock=stock-N WHERE id=? AND stock>=N
+        alt rowCount = 0
+            PS->>DB: ROLLBACK
+            PS-->>PC: InsufficientStockException
+            PC-->>C: 400 Bad Request
+        else rowCount = 1
+            PS->>DB: INSERT orders (...)
+            PS->>DS: roll()
+            DS-->>PS: {percent: 0 or 10 or 50}
+            PS->>DB: UPDATE orders SET discount=...
+            PS->>DB: INSERT activity_logs (SUCCESS)
+            PS->>DB: COMMIT
+            PS->>Cache: put("cooldown:...", true, ttl)
+            PS->>Q: dispatch(ProcessOrder)
+            PS-->>PC: PurchaseResult(DTO)
+            PC-->>C: 200 OK {order, discount}
+        end
+    end
+    Q-->>Q: worker picks job later
+    Q->>DB: UPDATE orders SET invoice_no, status=processed
 ```
 
 ---
 
-## 5. Prerequisites
+## 2. Prerequisites
 
-| Tool | Version | Notes |
-|------|---------|-------|
-| Docker Desktop | 4.x with Compose v2 | The only required runtime |
-| Git | any recent | For cloning and version control |
+| Tool          | Version  | Notes                                                   |
+|---------------|----------|---------------------------------------------------------|
+| Docker Engine | 24+      | `docker compose` v2 plugin required (not `docker-compose`) |
+| Git           | 2.30+    | For cloning                                             |
+| curl          | any      | For the smoke-test suite                               |
+| OS            | Win 10/11, macOS 12+, Linux | All three work; commands below assume a POSIX shell inside the `app` container |
 
-> **PHP / Composer / MySQL are NOT required locally.** Everything runs inside
-> containers. This keeps the project portable across macOS, Linux, and Windows.
+> No PHP / Composer / MySQL needed locally — everything runs inside Docker.
 
 ---
 
-## 6. Quick Start
+## 3. Step-by-Step Setup
+
+> All commands below are run from the **repository root** unless stated otherwise.
+
+### Step 1 — Clone & enter the project
 
 ```bash
-# 1. Clone
-git clone https://github.com/MD-Junayed000/Flash_Sale_Inventor_System.git
+git clone <your-repo-url> Flash_Sale_Inventor_System
 cd Flash_Sale_Inventor_System
+```
 
-# 2. Build & start the stack (first run: ~3 min to pull images)
+### Step 2 — Copy the env file
+
+```bash
+cp .env.example .env
+```
+
+If you change any value, restart the affected containers in Step 4.
+
+### Step 3 — Build & start the stack
+
+```bash
 docker compose up -d --build
+```
 
-# 3. Wait for "db" healthcheck, then migrate + seed
+Three containers should appear as **healthy / running**:
+
+```text
+NAME                 STATUS          PORTS
+flash-sale-app       Up (healthy)    0.0.0.0:8000->8000/tcp
+flash-sale-worker    Up              -
+flash-sale-db        Up (healthy)    0.0.0.0:3306->3306/tcp
+```
+
+### Step 4 — Install PHP dependencies & generate APP_KEY
+
+```bash
+docker compose exec app composer install --no-interaction --prefer-dist
+docker compose exec app php artisan key:generate
+```
+
+### Step 5 — Migrate & seed the database
+
+```bash
 docker compose exec app php artisan migrate --seed --force
-
-# 4. Verify
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/products
-# → 200
-
-# 5. Hit the API
-curl -X POST http://localhost:8000/api/purchase \
-  -H "Accept: application/json" \
-  -H "X-User-Email: alice@example.com" \
-  -H "Content-Type: application/json" \
-  -d '{"sku":"SKU-1001","quantity":1}'
 ```
 
-Open the product admin UI at: <http://localhost:8000/products>
+You should see at the end:
 
-### Daily Commands
-
-| Action | Command |
-|--------|---------|
-| Start stack | `docker compose up -d` |
-| Stop stack | `docker compose down` |
-| Reset DB | `docker compose exec app php artisan migrate:fresh --seed --force` |
-| View queue logs | `docker compose logs -f worker` |
-| Tail app logs | `docker compose logs -f app` |
-| Run smoke tests | `docker compose exec app bash tests/smoke-api.sh` |
-| Concurrency demo | `docker compose exec app php artisan purchase:simulate --sku=SKU-1001 --stock=5 --qty=2 --users=10` |
-| Enter app shell | `docker compose exec app bash` |
-| MySQL CLI | `docker compose exec db mysql -usail -ppassword flash_sale` |
-
----
-
-## 7. API Contract
-
-All requests/responses are JSON. Every endpoint requires `Accept: application/json`.
-
-### 7.1 `POST /api/purchase`
-
-**Headers**
-
-| Header | Required | Description |
-|--------|----------|-------------|
-| `Accept` | yes | `application/json` |
-| `Content-Type` | yes | `application/json` |
-| `X-User-Email` | yes | Identifies the buyer (used for cooldown) |
-
-**Body**
-
-```json
-{ "sku": "SKU-1001", "quantity": 2 }
+```text
+Database seeding completed successfully.
 ```
 
-| Outcome | HTTP | Body |
-|---------|------|------|
-| Success | `200` | `{"success":true,"order_id":12,"invoice":"INV-20260911-00012","discount":10,"payable":1800}` |
-| Validation error | `422` | `{"message":"...","errors":{"sku":["..."]}}` |
-| Product not found | `404` | `{"success":false,"message":"Product not found."}` |
-| Inactive product | `400` | `{"success":false,"message":"Product is not available for purchase."}` |
-| Insufficient stock | `400` | `{"success":false,"message":"Insufficient stock."}` |
-| Cooldown active | `429` | `{"success":false,"message":"You already purchased this product recently."}` |
+This creates:
 
-> The `invoice` field returns the string `"PENDING"` immediately — the queue
-> worker generates and persists the real invoice number (`INV-YYYYMMDD-NNNNN`)
-> within milliseconds. Polling or refreshing the order status would surface it.
+* Three products — `SKU-1001` (active, stock 10), `SKU-1002` (active, stock 5), `SKU-1003` (inactive)
+* One demo user — `demo@example.com`
+
+### Step 6 — Queue worker (already running)
+
+The `worker` service starts automatically with the stack. To watch its log:
+
+```bash
+docker compose logs -f worker
+```
+
+### Step 7 — Open the app
+
+* **Blade UI:** <http://localhost:8000/products>
+* **API base:**  `http://localhost:8000/api`
+
+You can now run the smoke test (Step 8) or hit endpoints manually.
+
+### Step 8 — Run the smoke-test suite
+
+```bash
+bash tests/smoke-api.sh
+```
+
+Expected output (last two lines):
+
+```text
+============================================================
+ RESULTS: 8 passed, 0 failed
+============================================================
+```
 
 ---
 
-## 8. Service Endpoints
+## 4. Environment Variables (`.env`)
 
-The product admin UI runs on Blade:
+The full list lives in `.env.example`. The **only values you must confirm before
+first run** are the ones below — they are pre-set so you do not need to change
+anything on a fresh clone.
 
-| Method | URL | Purpose |
-|--------|-----|---------|
-| `GET`  | `/products` | List products |
-| `GET`  | `/products/create` | New product form |
-| `POST` | `/products` | Persist new product |
-| `GET`  | `/products/{id}/edit` | Edit form |
-| `PUT`  | `/products/{id}` | Update product |
-| `DELETE` | `/products/{id}` | Soft delete / destroy |
+| Variable                       | Default / Example                  | Why it matters                                                                                       |
+|--------------------------------|------------------------------------|------------------------------------------------------------------------------------------------------|
+| `APP_URL`                      | `http://localhost:8000`            | Used in absolute URLs (verification mails, etc.)                                                     |
+| `APP_KEY`                      | *(generated by `key:generate`)*    | Required for encryption; **never commit a real key**                                                 |
+| `DB_CONNECTION`                | `mysql`                            | We use MySQL for transactions and atomic `UPDATE … WHERE stock >= n`                                |
+| `DB_HOST`                      | `db`                               | **Must match the docker service name**, not `127.0.0.1`                                              |
+| `DB_PORT`                      | `3306`                             | Internal container port                                                                              |
+| `DB_DATABASE`                  | `flash_sale`                       | Created automatically by the `db` healthcheck                                                        |
+| `DB_USERNAME` / `DB_PASSWORD`  | `sail` / `password`                | Match `docker-compose.yml` `MYSQL_USER` / `MYSQL_PASSWORD`                                           |
+| `QUEUE_CONNECTION`             | `database`                         | Jobs go to the `jobs` table — survives restarts, retryable                                          |
+| `CACHE_STORE`                  | `file`                             | Used for the purchase cooldown lock                                                                  |
+| `PURCHASE_COOLDOWN_SECONDS`    | `60`                               | Window in which the same `(email, sku)` cannot re-purchase. Set `0` to disable.                     |
+| `PURCHASE_COOLDOWN_STORE`      | *(empty — default store)*          | Point at `redis` in production so locks are shared across web workers                                |
+| `PURCHASE_DISCOUNT_WEIGHT_NONE`| `75`                               | Mystery discount weight for "no discount"                                                            |
+| `PURCHASE_DISCOUNT_WEIGHT_TEN` | `20`                               | Weight for 10% off                                                                                   |
+| `PURCHASE_DISCOUNT_WEIGHT_FIFTY`| `5`                              | Weight for 50% off                                                                                   |
+
+> After editing `.env`, run `docker compose exec app php artisan config:clear`.
 
 ---
 
-## 9. Database Schema
+## 5. Database Schema
 
 ```mermaid
 erDiagram
     PRODUCTS ||--o{ ORDERS : "has many"
+    PRODUCTS ||--o{ ACTIVITY_LOGS : "logged against"
+
     PRODUCTS {
-        bigint id PK
-        string name
-        string sku UK
-        decimal price
-        int stock_quantity
-        enum status
-        timestamps
+        bigint   id PK
+        string   sku UK
+        string   name
+        decimal  price
+        int      stock_quantity
+        string   status "ACTIVE or INACTIVE"
+        datetime created_at
+        datetime updated_at
     }
+
     ORDERS {
-        bigint id PK
-        bigint product_id FK
-        string user_email
-        string sku
-        int quantity
-        decimal unit_price
-        int discount_percentage
-        decimal payable_amount
-        string invoice_number
-        enum status
-        text failure_reason
-        timestamps
+        bigint   id PK
+        string   order_number UK "INV-YYYYMMDD-NNNNN"
+        string   user_email
+        string   sku FK
+        int      quantity
+        decimal  unit_price
+        decimal  discount_percent
+        decimal  final_price
+        string   status "pending or processed or failed"
+        datetime created_at
+        datetime updated_at
     }
+
     ACTIVITY_LOGS {
-        bigint id PK
-        string email
-        string sku
-        int quantity
-        enum status
-        text failure_reason
-        timestamps
+        bigint   id PK
+        string   user_email
+        string   sku
+        string   action "PURCHASE"
+        string   status "SUCCESS or FAILED"
+        string   reason "nullable"
+        json     metadata "nullable"
+        datetime created_at
     }
 ```
 
-`failed_jobs` and `jobs` tables are provided by Laravel's queue migrations.
+---
+
+## 6. REST API Reference
+
+All API endpoints respond with `application/json`. Send
+`-H "Accept: application/json"` to ensure Laravel returns JSON (not redirects).
+
+### 6.1 `POST /api/purchase`
+
+Purchase a quantity of a SKU.
+
+**Headers**
+
+| Header          | Required | Example                     |
+|-----------------|----------|-----------------------------|
+| `Accept`        | yes      | `application/json`          |
+| `Content-Type`  | yes      | `application/json`          |
+| `X-User-Email`  | yes      | `alice@example.com`         |
+
+**Body**
+
+```json
+{ "sku": "SKU-1002", "quantity": 1 }
+```
+
+**Validation rules (`PurchaseRequest`)**
+
+| Field      | Rule                                                    |
+|------------|---------------------------------------------------------|
+| `sku`      | `required`, `string`, `exists:products,sku`             |
+| `quantity` | `required`, `integer`, `min:1`, `max:99`                |
+| email      | derived from `X-User-Email`, must be a valid e-mail     |
+
+**Possible responses**
+
+| Status | When                              | Body shape (abridged)                                                                                                              |
+|--------|-----------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `200`  | Purchase OK                       | `"status":"ok"`, `discount_percent` is `0`, `10`, or `50`, plus a freshly created `order` object                                   |
+| `400`  | Product inactive or out of stock  | `"status":"error"`, `"error":"INSUFFICIENT_STOCK"` or `"INACTIVE_PRODUCT"`, `message`, `available`                                  |
+| `404`  | SKU not found                     | Laravel default 404 with `"message":"The selected sku is invalid."`                                                                |
+| `422`  | Body invalid                      | `"message"` plus `errors.{field}` array                                                                                            |
+| `429`  | Cooldown active                   | `"status":"error"`, `"error":"PURCHASE_COOLDOWN"`, `message`, `retry_in` (seconds remaining)                                      |
 
 ---
 
-## 10. Configuration
+## 7. Verification: Expected Results
 
-All runtime config is in `.env` (template at `.env.example`):
+> Run this checklist after **Step 8** of the setup. Each command assumes the
+> stack is up and `migrate:fresh --seed` has just been executed.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `DB_HOST` | `db` | MySQL service name in compose network |
-| `DB_DATABASE` | `flash_sale` | Schema name |
-| `QUEUE_CONNECTION` | `database` | Use the DB queue driver |
-| `CACHE_STORE` | `file` | Cache backend for cooldowns |
-| `PURCHASE_COOLDOWN_SECONDS` | `60` | Override in `config/purchase.php` |
-
----
-
-## 11. Testing & Verification
-
-### 11.1 API Smoke Tests
-
-`tests/smoke-api.sh` runs 8 black-box scenarios end-to-end:
+### 7.1 Happy path (200)
 
 ```bash
-docker compose exec app bash tests/smoke-api.sh
+curl -i -X POST http://localhost:8000/api/purchase \
+  -H "Accept: application/json" \
+  -H "Content-Type: application/json" \
+  -H "X-User-Email: alice@test.com" \
+  -d '{"sku":"SKU-1002","quantity":1}'
 ```
 
-Latest result:
+**Expected:** `HTTP/1.1 200 OK`, body contains `"status":"ok"` and
+`"discount_percent":0` (or 10 or 50), plus a freshly created `order` object.
 
-```text
-[1] Validation: missing fields (422)        → PASS
-[2] Inactive product (400)                  → PASS
-[3] Product not found (404)                 → PASS
-[4] Insufficient stock (400)                → PASS
-[5] Successful purchase (200)               → PASS
-[6] Cooldown active (429)                   → PASS
-[7] Different email bypasses cooldown (200) → PASS
-[8] Different sku bypasses cooldown (200)   → PASS
-RESULTS: 8 passed, 0 failed
+### 7.2 Insufficient stock (400)
+
+```bash
+curl -i -X POST http://localhost:8000/api/purchase \
+  -H "Accept: application/json" -H "Content-Type: application/json" \
+  -H "X-User-Email: alice@test.com" \
+  -d '{"sku":"SKU-1001","quantity":99}'
 ```
 
-### 11.2 Concurrency Proof
+**Expected:** `HTTP/1.1 400 Bad Request`, `error: "INSUFFICIENT_STOCK"`.
+
+### 7.3 Inactive product (400)
+
+```bash
+curl -i -X POST http://localhost:8000/api/purchase \
+  -H "Accept: application/json" -H "Content-Type: application/json" \
+  -H "X-User-Email: alice@test.com" \
+  -d '{"sku":"SKU-1003","quantity":1}'
+```
+
+**Expected:** `HTTP/1.1 400 Bad Request`, `error: "INACTIVE_PRODUCT"`.
+
+### 7.4 Unknown SKU (404)
+
+```bash
+curl -i -X POST http://localhost:8000/api/purchase \
+  -H "Accept: application/json" -H "Content-Type: application/json" \
+  -H "X-User-Email: alice@test.com" \
+  -d '{"sku":"SKU-9999","quantity":1}'
+```
+
+**Expected:** `HTTP/1.1 404 Not Found`.
+
+### 7.5 Validation error (422)
+
+```bash
+curl -i -X POST http://localhost:8000/api/purchase \
+  -H "Accept: application/json" \
+  -H "X-User-Email: alice@test.com"
+```
+
+**Expected:** `HTTP/1.1 422 Unprocessable Entity`, body has `errors.sku`.
+
+### 7.6 Cooldown (429)
+
+Run §7.1 twice in a row. The second call should return `HTTP 429` with
+`error: "PURCHASE_COOLDOWN"` and a numeric `retry_in` (seconds remaining).
+
+### 7.7 Activity log check
+
+```bash
+docker compose exec db mysql -uroot -proot flash_sale \
+  -e "SELECT user_email, sku, status, reason FROM activity_logs ORDER BY id DESC LIMIT 5;"
+```
+
+**Expected:** a mix of `SUCCESS` and `FAILED` rows corresponding to the calls
+above, including cooldown and inactive-product failures.
+
+---
+
+## 8. Concurrency & Discount Simulations
+
+### 8.1 Concurrency test (Task 5)
 
 ```bash
 docker compose exec app php artisan purchase:simulate \
-  --sku=SKU-1001 --stock=5 --qty=2 --users=10
+  --sku=SKU-1001 --qty=2 --users=10 --stock=5 --reset
 ```
 
-Latest result:
+**Expected:** *exactly 2* `SUCCESS` orders and *exactly 8* `FAILED` orders;
+final `stock_quantity` for `SKU-1001` is `1`. No overselling.
 
-```text
-Starting stock:     5
-Successful:         2
-Failed (stock):     8
-Final stock:        1
-Expected:           1  (5 - 2*2)
-✅ PASS: No overselling. Stock and orders are consistent.
-```
-
-### 11.3 Queue Verification
+### 8.2 Discount distribution test (Bonus)
 
 ```bash
-docker compose exec app php artisan tinker \
-  --execute='foreach(App\Models\Order::all() as $o){echo $o->id." | ".$o->status->value." | ".$o->invoice_number.PHP_EOL;}'
+docker compose exec app php artisan discount:simulate --orders=500
 ```
+
+**Expected:** distribution close to `75 / 20 / 5`. A typical 500-order run
+yields roughly `375 / 100 / 25` plus or minus a few percent.
+
+---
+
+## 9. Project Layout
 
 ```text
-1 | completed | INV-20260911-00001
-2 | completed | INV-20260911-00002
-```
-
-### 11.4 Activity Log Audit
-
-```bash
-docker compose exec app php artisan tinker \
-  --execute='foreach(App\Models\ActivityLog::latest()->take(8)->get() as $a){echo $a->email." | ".$a->sku." | ".$a->status->value." | ".$a->failure_reason.PHP_EOL;}'
-```
-
-```text
-alice@test.com | SKU-1002 | success |
-bob@test.com   | SKU-1002 | success |
-alice@test.com | SKU-1001 | success |
-alice@test.com | SKU-1002 | failed | You already purchased this product recently.
-alice@test.com | SKU-1002 | success |
-alice@test.com | SKU-1001 | failed | Insufficient stock.
-alice@test.com | SKU-1003 | failed | Product is not available for purchase.
-alice@test.com | SKU-9999 | failed | Product not found.
+.
+├── app/
+│   ├── Console/Commands/
+│   │   ├── SimulateConcurrentPurchasesCommand.php   # Task 5 demo
+│   │   └── SimulateDiscountDistributionCommand.php  # Bonus demo
+│   ├── Enums/
+│   │   ├── ProductStatus.php
+│   │   ├── OrderStatus.php
+│   │   └── ActivityStatus.php
+│   ├── Exceptions/
+│   │   ├── InsufficientStockException.php
+│   │   ├── InactiveProductException.php
+│   │   ├── ProductNotFoundException.php
+│   │   └── PurchaseCooldownException.php
+│   ├── Http/
+│   │   ├── Controllers/
+│   │   │   ├── ProductController.php                # Blade CRUD
+│   │   │   └── Api/PurchaseController.php           # thin API entry
+│   │   └── Requests/
+│   │       ├── PurchaseRequest.php                  # API validation
+│   │       ├── StoreProductRequest.php
+│   │       └── UpdateProductRequest.php
+│   ├── Jobs/
+│   │   └── ProcessOrder.php                         # async post-purchase
+│   ├── Models/
+│   │   ├── Product.php
+│   │   ├── Order.php
+│   │   └── ActivityLog.php
+│   └── Services/
+│       ├── Contracts/
+│       │   ├── PurchaseServiceInterface.php
+│       │   └── DiscountServiceInterface.php
+│       ├── DTOs/
+│       │   └── PurchaseResult.php                   # API response shape
+│       ├── DiscountService.php                      # bonus mystery roll
+│       └── PurchaseService.php                      # core business logic
+├── config/purchase.php                              # tunable weights and ttl
+├── database/
+│   ├── migrations/                                  # products, orders, logs
+│   └── seeders/DatabaseSeeder.php                   # 3 demo SKUs
+├── docker/                                          # PHP 8.4 image
+├── docker-compose.yml                               # app + worker + db
+├── routes/api.php
+├── routes/web.php
+└── tests/smoke-api.sh                               # 8-case API smoke test
 ```
 
 ---
 
-## 12. Implementation Walkthrough
+## 10. Design Decisions & Trade-offs
 
-This section maps each assessment requirement to the file(s) that satisfy it.
+| Decision                                         | Why                                                                                          | Alternative considered                                  |
+|--------------------------------------------------|----------------------------------------------------------------------------------------------|---------------------------------------------------------|
+| **Atomic `UPDATE … WHERE stock >= n`**           | Single round-trip, race-condition free, no `SELECT … FOR UPDATE` needed                      | Pessimistic row lock (`lockForUpdate`)                  |
+| **Service layer + interface**                    | Controllers stay under 30 lines, easy to mock in tests                                      | Fat controllers / repository pattern                    |
+| **Custom exceptions** for domain errors          | Controller maps each exception to a specific HTTP code via `PurchaseResult.statusCode`        | Returning tuples / sentinel values                      |
+| **`database` queue driver**                      | Zero extra infra, jobs survive container restarts, retryable                                 | Redis / `sync` (loses durability) / `beanstalkd`         |
+| **File cache for cooldown**                      | Works out-of-the-box; trivial to swap to Redis via env (`PURCHASE_COOLDOWN_STORE`)            | DB table lock (extra round-trip per request)            |
+| **DTO `PurchaseResult`** returned by service     | Explicit shape; controller cannot accidentally leak Eloquent attributes                      | Returning `array` / Eloquent model                      |
+| **Activity log on both success & failure**       | Full audit trail (Task 7), used in tests                                                     | Logging only on success                                 |
+| **Discount weights in `config/purchase.php`**    | Tunable without code changes; demo-friendly                                                  | Hardcoded in `DiscountService`                           |
 
-| Task | Requirement | Implementation |
-|------|-------------|----------------|
-| **Task 1** — Product CRUD (15) | Full CRUD + status enum | `ProductController`, `StoreProductRequest`, `UpdateProductRequest`, Blade views in `resources/views/products/`, `ProductStatus` enum |
-| **Task 2** — Purchase API (20) | `POST /api/purchase` with all rules | `routes/api.php`, `PurchaseController`, `PurchaseRequest` |
-| **Task 3** — Queue + Order (15) | Create Order, dispatch job, generate invoice, mark COMPLETED | `Order` model, `ProcessOrder` job, `OrderService::markCompleted()` |
-| **Task 4** — Failed Orders (10) | Job failure → status=FAILED + reason | `ProcessOrder::failed(Throwable)` |
-| **Task 5** — No Overselling (15) | Concurrency-safe stock decrement | Atomic UPDATE in `PurchaseService::attempt()` inside a DB transaction |
-| **Task 6** — Cooldown (10) | 1-minute per-email+SKU, return 429 | Cache TTL in `PurchaseService` before transaction |
-| **Task 7** — Activity Log (5) | Every attempt logged | `ActivityLog::create()` inside service on all branches |
-| **Bonus** — Mystery Discount (10) | 20%/5%/75% distribution + stored fields | `DiscountService::roll()` invoked before order persistence |
-| **General** — Meaningful commits | Incremental git history | See `git log` |
-| **General** — README with setup | This file | ✅ |
-| **General** — AI-assisted, explainable | All decisions documented in §2 | ✅ |
-
-### Why "Thin Controllers + Service Layer"?
-
-The `PurchaseController` is **~30 lines**:
-
-```php
-public function store(PurchaseRequest $request, PurchaseServiceInterface $svc): JsonResponse
-{
-    try {
-        $result = $svc->attempt(
-            email:    $request->header('X-User-Email', ''),
-            sku:      $request->validated('sku'),
-            quantity: $request->validated('quantity'),
-        );
-        return response()->json($result->toArray());
-    } catch (InsufficientStockException) { return resp(false,'Insufficient stock.',400); }
-    catch  (InactiveProductException)   { return resp(false,'Product is not available for purchase.',400); }
-    catch  (PurchaseCooldownException)  { return resp(false,'You already purchased this product recently.',429); }
-    catch  (ProductNotFoundException)   { return resp(false,'Product not found.',404); }
-}
-```
-
-It does **no** validation, **no** SQL, **no** queue logic — only input
-unpacking, delegation, and exception-to-HTTP translation.
-
-The `PurchaseService` owns *all* of:
-- cooldown check
-- transaction + atomic stock decrement
-- discount roll
-- order creation
-- activity log
-- queue dispatch
-- cooldown set
-
-This is the **single source of truth** the assessment evaluates.
-
----
-
-## License
-
-MIT — assessment submission for MD-Junayed000 / Flash Sale Inventory System.
+For a deeper write-up of *why this over that*, see [`EXPLAIN.md`](./EXPLAIN.md).
