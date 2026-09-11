@@ -1,0 +1,72 @@
+services:
+  app:
+    image: flash-sale-php:latest
+    container_name: flash-sale-app
+    working_dir: /var/www/html
+    volumes:
+      - ./:/var/www/html
+    ports:
+      - "8000:8000"
+    environment:
+      DB_HOST: db
+      DB_DATABASE: flash_sale
+      DB_USERNAME: sail
+      DB_PASSWORD: password
+    command: >
+      sh -c "php artisan serve --host=0.0.0.0 --port=8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - flash-sale-net
+
+  worker:
+    image: flash-sale-php:latest
+    container_name: flash-sale-worker
+    working_dir: /var/www/html
+    volumes:
+      - ./:/var/www/html
+    environment:
+      DB_HOST: db
+      DB_DATABASE: flash_sale
+      DB_USERNAME: sail
+      DB_PASSWORD: password
+    command: >
+      sh -c "php artisan queue:work database --tries=3 --sleep=1 --timeout=60"
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_started
+    networks:
+      - flash-sale-net
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.0
+    container_name: flash-sale-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: flash_sale
+      MYSQL_USER: sail
+      MYSQL_PASSWORD: password
+    ports:
+      - "3306:3306"
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      retries: 10
+      interval: 5s
+      timeout: 5s
+    networks:
+      - flash-sale-net
+
+volumes:
+  dbdata:
+    driver: local
+
+networks:
+  flash-sale-net:
+    driver: bridge
