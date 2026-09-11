@@ -29,7 +29,6 @@ services:
             LOG_LEVEL: info
             LOG_CORRELATION_ENABLED: "true"
             APP_ENV: local
-            APP_KEY: base64:placeholder_replace_with_artisan_key_generate
         command: >
             sh -c "php artisan config:clear && php artisan serve --host=0.0.0.0 --port=8000"
         depends_on:
