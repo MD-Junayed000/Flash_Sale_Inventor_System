@@ -124,7 +124,15 @@ final class PurchaseService implements PurchaseServiceInterface
         }
 
         // 7. Set cooldown AFTER successful purchase (Task 6)
-        $this->cache->put($cooldownKey, true, now()->addMinutes(1));
+        $ttl = (int) config('purchase.cooldown_seconds', 60);
+        $store = config('purchase.cooldown_store');
+        if ($ttl > 0) {
+            if ($store !== null && $store !== '') {
+                \Illuminate\Support\Facades\Cache::store($store)->put($cooldownKey, true, $ttl);
+            } else {
+                $this->cache->put($cooldownKey, true, $ttl);
+            }
+        }
 
         // 8. Dispatch queue job (Task 3) - job will set status=completed + invoice
         ProcessOrder::dispatch($order->id);

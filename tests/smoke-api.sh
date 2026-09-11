@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
+# Smoke test suite for the Flash Sale Inventory API.
+# Idempotent: resets DB + cache on every run.
+
 set -u
 
 BASE="http://localhost:8000/api"
 PASS=0
 FAIL=0
+
+# Reset DB + cache so the suite is idempotent across re-runs.
+echo "Resetting database (migrate:fresh --seed) and cache..."
+docker compose exec -T app php artisan migrate:fresh --seed --force >/dev/null 2>&1
+docker compose exec -T app php artisan cache:clear            >/dev/null 2>&1
+sleep 2
 
 run() {
   local label="$1"; shift
