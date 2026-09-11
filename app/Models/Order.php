@@ -15,6 +15,7 @@ class Order extends Model
 
     protected $fillable = [
         'product_id',
+        'user_id',
         'user_email',
         'sku',
         'quantity',
@@ -22,6 +23,8 @@ class Order extends Model
         'discount_percentage',
         'payable_amount',
         'invoice_number',
+        'payment_ref',
+        'idempotency_key',
         'status',
         'failure_reason',
     ];
@@ -29,17 +32,22 @@ class Order extends Model
     protected function casts(): array
     {
         return [
-            'quantity' => 'integer',
-            'unit_price' => 'decimal:2',
-            'payable_amount' => 'decimal:2',
+            'quantity'            => 'integer',
+            'unit_price'          => 'decimal:2',
+            'payable_amount'      => 'decimal:2',
             'discount_percentage' => 'integer',
-            'status' => OrderStatus::class,
+            'status'              => OrderStatus::class,
         ];
     }
 
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class);
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
     }
 
     public function isPending(): bool

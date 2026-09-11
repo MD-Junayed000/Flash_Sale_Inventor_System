@@ -2,20 +2,32 @@
 
 namespace App\Models;
 
-// use Illuminate\Contracts\Auth\MustVerifyEmail;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Laravel\Sanctum\HasApiTokens;
 
+/**
+ * Eloquent user model for the Flash Sale Inventory system.
+ *
+ * Added HasApiTokens (Sanctum) to support token-based authentication on the
+ * v1 API.  This replaces the legacy X-User-Email header, which was trivial
+ * to spoof and unsuitable for production.
+ *
+ * @property int    $id
+ * @property string $name
+ * @property string $email
+ * @property string $password
+ */
 class User extends Authenticatable
 {
     /** @use HasFactory<\Database\Factories\UserFactory> */
-    use HasFactory, Notifiable;
+    use HasApiTokens, HasFactory, Notifiable;
 
     /**
-     * The attributes that are mass assignable.
-     *
-     * @var list<string>
+     * Mass-assignable attributes. Tokens are managed exclusively through
+     * Sanctum's createToken() / tokenable()->tokens() relation, never via
+     * direct assignment, so they are intentionally NOT listed here.
      */
     protected $fillable = [
         'name',
@@ -24,9 +36,8 @@ class User extends Authenticatable
     ];
 
     /**
-     * The attributes that should be hidden for serialization.
-     *
-     * @var list<string>
+     * Attributes hidden from serialization. Sanctum tokens are exposed only
+     * via the dedicated endpoint and must never leak through the JSON dump.
      */
     protected $hidden = [
         'password',
@@ -34,7 +45,9 @@ class User extends Authenticatable
     ];
 
     /**
-     * Get the attributes that should be cast.
+     * Casts.  We deliberately keep password as a hashed string (handled by
+     * the mutator on the auth flow) and not a 'hashed' cast so that older
+     * callers passing already-hashed passwords still work.
      *
      * @return array<string, string>
      */
@@ -42,7 +55,7 @@ class User extends Authenticatable
     {
         return [
             'email_verified_at' => 'datetime',
-            'password' => 'hashed',
+            'password'          => 'hashed',
         ];
     }
 }

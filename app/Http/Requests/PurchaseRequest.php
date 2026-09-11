@@ -6,11 +6,17 @@ namespace App\Http\Requests;
 
 use Illuminate\Foundation\Http\FormRequest;
 
-class PurchaseRequest extends FormRequest
+/**
+ * FormRequest for POST /api/v1/purchase.
+ *
+ * Routes mounting this must be behind `auth:sanctum` — the user identity
+ * comes from the bearer token, never from a header.
+ */
+final class PurchaseRequest extends FormRequest
 {
     public function authorize(): bool
     {
-        return true;
+        return $this->user() !== null;
     }
 
     /**
@@ -20,17 +26,16 @@ class PurchaseRequest extends FormRequest
     {
         return [
             'sku'      => ['required', 'string', 'max:64'],
-            'quantity' => ['required', 'integer', 'min:1'],
+            'quantity' => ['required', 'integer', 'min:1', 'max:10'],
         ];
     }
 
     public function email(): string
     {
-        $email = (string) $this->header('X-User-Email', '');
-        if ($email === '') {
-            $email = (string) $this->input('email', 'anonymous@example.com');
+        $user = $this->user();
+        if ($user && $user->email) {
+            return strtolower(trim((string) $user->email));
         }
-
-        return strtolower(trim($email));
+        return (string) $this->input('email', 'anonymous@example.com');
     }
 }

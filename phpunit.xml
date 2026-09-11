@@ -3,6 +3,7 @@
          xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
          bootstrap="vendor/autoload.php"
          colors="true"
+         cacheDirectory=".phpunit.cache"
 >
     <testsuites>
         <testsuite name="Unit">
@@ -18,16 +19,38 @@
         </include>
     </source>
     <php>
-        <env name="APP_ENV" value="testing"/>
-        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
-        <env name="BCRYPT_ROUNDS" value="4"/>
-        <env name="CACHE_STORE" value="array"/>
-        <!-- <env name="DB_CONNECTION" value="sqlite"/> -->
-        <!-- <env name="DB_DATABASE" value=":memory:"/> -->
-        <env name="MAIL_MAILER" value="array"/>
-        <env name="PULSE_ENABLED" value="false"/>
-        <env name="QUEUE_CONNECTION" value="sync"/>
-        <env name="SESSION_DRIVER" value="array"/>
-        <env name="TELESCOPE_ENABLED" value="false"/>
+        <ini name="display_errors" value="1"/>
+        <ini name="error_reporting" value="-1"/>
+        <server name="APP_ENV" value="testing" force="true"/>
+        <server name="APP_KEY" value="base64:rFbKfW3qA4y0xN5BzP8i1pLmS9xV7hUuM6tZwYjX2kE="/>
+        <server name="APP_DEBUG" value="true"/>
+        <server name="APP_URL" value="http://localhost"/>
+        <server name="BCRYPT_ROUNDS" value="4"/>
+        <server name="DB_CONNECTION" value="sqlite"/>
+        <server name="DB_DATABASE" value=":memory:"/>
+        <server name="CACHE_STORE" value="array"/>
+        <server name="CACHE_PREFIX" value="flash_sale_test"/>
+        <server name="QUEUE_CONNECTION" value="sync"/>
+        <server name="SESSION_DRIVER" value="array"/>
+        <server name="MAIL_MAILER" value="array"/>
+        <server name="PULSE_ENABLED" value="false"/>
+        <server name="TELESCOPE_ENABLED" value="false"/>
+        <server name="LOG_CHANNEL" value="stack"/>
+        <server name="LOG_STACK" value="single"/>
+        <server name="LOG_LEVEL" value="warning"/>
+        <server name="LOG_CORRELATION_ENABLED" value="true"/>
+        <server name="PURCHASE_COOLDOWN_SECONDS" value="60"/>
+        <server name="PURCHASE_COOLDON_STORE" value="array"/>
+        <server name="PURCHASE_QUEUE_CONNECTION" value="sync"/>
+        <server name="PURCHASE_QUEUE_NAME" value="orders"/>
+        <server name="PURCHASE_MAX_RETRIES" value="3"/>
+        <server name="PURCHASE_BACKOFF" value="1,2,3"/>
+        <server name="PURCHASE_DISCOUNT_WEIGHT_NONE" value="75"/>
+        <server name="PURCHASE_DISCOUNT_WEIGHT_TEN" value="20"/>
+        <server name="PURCHASE_DISCOUNT_WEIGHT_FIFTY" value="5"/>
+        <server name="PURCHASE_RATE_LIMIT_PER_MIN" value="1000"/>
+        <server name="PURCHASE_RATE_LIMIT_PER_IP_PER_MIN" value="1000"/>
+        <server name="REDIS_HOST" value="127.0.0.1"/>
+        <server name="REDIS_PORT" value="6379"/>
     </php>
 </phpunit>

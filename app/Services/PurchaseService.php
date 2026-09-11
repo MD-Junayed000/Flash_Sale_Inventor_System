@@ -9,6 +9,7 @@ use App\Enums\OrderStatus;
 use App\Enums\ProductStatus;
 use App\Exceptions\InactiveProductException;
 use App\Exceptions\InsufficientStockException;
+use App\Exceptions\ProductNotFoundException;
 use App\Exceptions\PurchaseCooldownException;
 use App\Jobs\ProcessOrder;
 use App\Models\ActivityLog;
@@ -23,42 +24,61 @@ use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
- * Core orchestration for purchase flow.
+ * Core orchestration for the flash-sale purchase flow.
  *
- * Responsibilities:
- *   1. Cooldown check (Task 6)
- *   2. Find product + validate active (Task 2)
- *   3. Atomic stock decrement inside transaction (Task 5 - prevents overselling)
- *   4. Apply mystery discount (Bonus)
- *   5. Create order with status=pending
- *   6. Dispatch queue job (Task 3)
- *   7. Log activity (Task 7)
+ * Responsibilities (in order):
+ *   1. Cooldown check — cheap, fail fast on repeat purchases (Task 6)
+ *   2. Find product + validate it is active (Task 2)
+ *   3. Atomic stock decrement inside a DB transaction (Task 5, prevents oversell)
+ *   4. Roll mystery discount (Bonus task)
+ *   5. Persist Order with status=pending
+ *   6. Dispatch the ProcessOrder queue job (Task 3)
+ *   7. Write activity log (Task 7)
  *
- * Failures roll back the transaction (stock not decremented if order creation fails).
+ * Domain failures throw typed exceptions that the controller maps to specific HTTP
+ * status codes (409, 404, 422, 429). Unexpected failures re-throw so the global
+ * handler can produce a generic 500.
  */
 final class PurchaseService implements PurchaseServiceInterface
 {
     public function __construct(
         private readonly DiscountServiceInterface $discountService,
         private readonly CacheContract $cache,
-    ) {}
+    ) {
+    }
 
-    public function attempt(string $email, string $sku, int $quantity): PurchaseResult
-    {
-        // 1. Cooldown check (Task 6) - cheap, fail fast
+    /**
+     * Attempt a purchase.
+     *
+     * @param string      $email           Authenticated user email.
+     * @param string      $sku             Product SKU.
+     * @param int         $quantity        Units requested (>0).
+     * @param string|null $paymentRef      Optional client payment reference (audit only).
+     * @param string|null $idempotencyKey  Optional Idempotency-Key header for replays.
+     *
+     * @throws ProductNotFoundException     when the SKU does not exist
+     * @throws InactiveProductException     when the SKU is not active
+     * @throws InsufficientStockException   when not enough stock
+     * @throws PurchaseCooldownException    when the buyer has already purchased recently
+     */
+    public function attempt(
+        string  $email,
+        string  $sku,
+        int     $quantity,
+        ?string $paymentRef     = null,
+        ?string $idempotencyKey = null,
+        ?int    $userId         = null,
+    ): PurchaseResult {
+        // 1. Cooldown check — cheap and out-of-transaction.
         $cooldownKey = $this->cooldownKey($email, $sku);
         if ($this->cache->has($cooldownKey)) {
-            $message = 'You already purchased this product recently.';
-            $this->logFailure($email, $sku, $quantity, $message);
+            $this->logFailure($email, $sku, $quantity, 'cooldown_active');
 
-            return PurchaseResult::failure(429, $message);
+            throw new PurchaseCooldownException($email, $sku);
         }
 
         try {
-            // 2-6. Everything inside a single transaction
-            $order = DB::transaction(function () use ($email, $sku, $quantity) {
-                // Lock the product row to serialize concurrent buyers for this SKU.
-                // The atomic WHERE-decrement below also guarantees correctness if the lock is bypassed.
+            $order = DB::transaction(function () use ($email, $sku, $quantity, $paymentRef, $idempotencyKey, $userId) {
                 /** @var Product|null $product */
                 $product = Product::query()
                     ->where('sku', $sku)
@@ -66,24 +86,22 @@ final class PurchaseService implements PurchaseServiceInterface
                     ->first();
 
                 if (! $product) {
-                    throw new \App\Exceptions\ProductNotFoundException("Product with SKU '{$sku}' not found.");
+                    throw new ProductNotFoundException($sku);
                 }
 
                 if ($product->status !== ProductStatus::Active) {
                     throw new InactiveProductException($sku);
                 }
 
-                // Atomic conditional decrement. Even without the lock above, MySQL guarantees
-                // correctness here because the WHERE clause is evaluated against committed data.
-                $decremented = $product->decrementStock($quantity);
-                if (! $decremented) {
+                // Conditional UPDATE — even if the lock were skipped, MySQL guarantees
+                // correctness because the WHERE clause runs against committed data.
+                if (! $product->decrementStock($quantity)) {
                     throw new InsufficientStockException(
                         requested: $quantity,
-                        available: (int) $product->fresh()?->stock_quantity ?? 0,
+                        available: (int) ($product->fresh()?->stock_quantity ?? 0),
                     );
                 }
 
-                // Roll discount BEFORE creating the order (Bonus)
                 $discount = $this->discountService->roll();
                 $payable  = $this->discountService->calculatePayable(
                     (float) $product->price,
@@ -94,90 +112,84 @@ final class PurchaseService implements PurchaseServiceInterface
                 return Order::create([
                     'product_id'          => $product->id,
                     'user_email'          => $email,
+                    'user_id'             => $userId,
                     'sku'                 => $sku,
                     'quantity'            => $quantity,
                     'unit_price'          => $product->price,
                     'discount_percentage' => $discount,
                     'payable_amount'      => $payable,
+                    'payment_ref'         => $paymentRef,
+                    'idempotency_key'     => $idempotencyKey,
                     'status'              => OrderStatus::Pending,
                 ]);
             });
-        } catch (InactiveProductException $e) {
-            $this->logFailure($email, $sku, $quantity, 'Product is not active.');
-            return PurchaseResult::failure(400, 'Product is not available for purchase.');
-        } catch (InsufficientStockException $e) {
-            $this->logFailure($email, $sku, $quantity, 'Insufficient stock.');
-            return PurchaseResult::failure(400, 'Insufficient stock.');
-        } catch (\App\Exceptions\ProductNotFoundException $e) {
-            $this->logFailure($email, $sku, $quantity, 'Product not found.');
-            return PurchaseResult::failure(404, 'Product not found.');
+        } catch (ProductNotFoundException|InactiveProductException|InsufficientStockException|PurchaseCooldownException $e) {
+            // Domain failures re-throw so the controller can map them.
+            throw $e;
         } catch (Throwable $e) {
-            // Unknown error - log full context, surface a generic message
-            Log::error('Purchase failed unexpectedly', [
-                'email' => $email,
-                'sku' => $sku,
+            Log::error('purchase.unexpected', [
+                'email'    => $email,
+                'sku'      => $sku,
                 'quantity' => $quantity,
-                'error' => $e->getMessage(),
+                'error'    => $e->getMessage(),
+                'class'    => $e::class,
             ]);
-            $this->logFailure($email, $sku, $quantity, 'Internal error: ' . $e->getMessage());
-            return PurchaseResult::failure(500, 'Could not process purchase.');
+
+            // Generic surface — do not leak internals to the client.
+            throw new \RuntimeException('Could not process purchase.', 0, $e);
         }
 
-        // 7. Set cooldown AFTER successful purchase (Task 6)
+        // Cooldown only AFTER successful purchase so a failure does not lock out the user.
         $ttl = (int) config('purchase.cooldown_seconds', 60);
-        $store = config('purchase.cooldown_store');
         if ($ttl > 0) {
+            $store = config('purchase.cooldown_store');
             if ($store !== null && $store !== '') {
-                \Illuminate\Support\Facades\Cache::store($store)->put($cooldownKey, true, $ttl);
+                \Illuminate\Support\Facades\Cache::store($store)
+                    ->put($cooldownKey, true, $ttl);
             } else {
                 $this->cache->put($cooldownKey, true, $ttl);
             }
         }
 
-        // 8. Dispatch queue job (Task 3) - job will set status=completed + invoice
         ProcessOrder::dispatch($order->id);
-
-        // 9. Log success (Task 7)
         $this->logSuccess($email, $sku, $quantity);
 
-        return PurchaseResult::success(
-            orderId: $order->id,
-            invoice: $order->invoice_number ?? 'PENDING',
-            discount: (int) $order->discount_percentage,
-            payable: (float) $order->payable_amount,
+        return PurchaseResult::ok(
+            orderId:            $order->id,
+            orderUuid:          $order->invoice_number ?? '',
+            status:             $order->status->value,
+            unitPrice:          (float) $order->unit_price,
+            payableAmount:      (float) $order->payable_amount,
+            discountPercentage: (int) $order->discount_percentage,
         );
     }
 
     public function completeOrder(Order $order): void
     {
-        $invoice = sprintf(
-            'INV-%s-%05d',
-            now()->format('Ymd'),
-            $order->id,
-        );
+        $invoice = sprintf('INV-%s-%05d', now()->format('Ymd'), $order->id);
 
         $order->update([
-            'invoice_number' => $invoice,
-            'status' => OrderStatus::Completed,
-            'failure_reason' => null,
+            'invoice_number'  => $invoice,
+            'status'          => OrderStatus::Completed,
+            'failure_reason'  => null,
         ]);
 
-        Log::info('Order completed', [
+        Log::info('order.completed', [
             'order_id' => $order->id,
-            'invoice' => $invoice,
+            'invoice'  => $invoice,
         ]);
     }
 
     public function failOrder(Order $order, Throwable $e): void
     {
         $order->update([
-            'status' => OrderStatus::Failed,
+            'status'         => OrderStatus::Failed,
             'failure_reason' => $e->getMessage(),
         ]);
 
-        Log::error('Order failed', [
+        Log::error('order.failed', [
             'order_id' => $order->id,
-            'reason' => $e->getMessage(),
+            'reason'   => $e->getMessage(),
         ]);
     }
 
@@ -189,10 +201,10 @@ final class PurchaseService implements PurchaseServiceInterface
     private function logSuccess(string $email, string $sku, int $quantity): void
     {
         ActivityLog::create([
-            'email' => $email,
-            'sku' => $sku,
-            'quantity' => $quantity,
-            'status' => ActivityStatus::Success,
+            'email'          => $email,
+            'sku'            => $sku,
+            'quantity'       => $quantity,
+            'status'         => ActivityStatus::Success,
             'failure_reason' => null,
         ]);
     }
@@ -200,11 +212,13 @@ final class PurchaseService implements PurchaseServiceInterface
     private function logFailure(string $email, string $sku, int $quantity, string $reason): void
     {
         ActivityLog::create([
-            'email' => $email,
-            'sku' => $sku,
-            'quantity' => $quantity,
-            'status' => ActivityStatus::Failed,
+            'email'          => $email,
+            'sku'            => $sku,
+            'quantity'       => $quantity,
+            'status'         => ActivityStatus::Failed,
             'failure_reason' => $reason,
         ]);
     }
 }
+
+

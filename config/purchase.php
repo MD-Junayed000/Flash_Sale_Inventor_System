@@ -1,64 +1,85 @@
 <?php
 
-declare(strict_types=1);
+/**
+ * Flash-sale-specific configuration.
+ *
+ * Every value can be overridden from .env without code changes so
+ * tests can dial things down (sync queue, array cache, etc.).
+ */
 
 return [
 
     /*
     |--------------------------------------------------------------------------
-    | Purchase Cooldown Window
+    | Cooldown
     |--------------------------------------------------------------------------
+    | A user (identified by their Sanctum-authenticated id) cannot purchase
+    | the same SKU more than once within `cooldown_seconds`.
     |
-    | How long (in seconds) the same user must wait between purchases of the
-    | same SKU. Set to 0 to disable the cooldown.
-    |
-    | Override at runtime with the PURCHASE_COOLDOWN_SECONDS environment
-    | variable (e.g. for load tests you can shorten it to 1s).
-    |
+    | `cooldown_store` defaults to the same store the application cache uses
+    | (which is Redis in production). Tests use `array` for determinism.
     */
-
     'cooldown_seconds' => (int) env('PURCHASE_COOLDOWN_SECONDS', 60),
+    'cooldown_store'   => env('PURCHASE_COOLDON_STORE', env('CACHE_STORE', 'redis')),
 
     /*
     |--------------------------------------------------------------------------
-    | Cache Store for Cooldown Keys
+    | Queue
     |--------------------------------------------------------------------------
-    |
-    | Which cache store should hold the cooldown lock? Defaults to the
-    | application's default store. In production you'd typically point this
-    | at Redis so the lock is shared across multiple web workers.
-    |
+    | Which queue connection / queue name should ProcessOrder jobs go to.
+    | In production this MUST be redis (or rabbitmq) for throughput.
     */
-
-    'cooldown_store' => env('PURCHASE_COOLDOWN_STORE', null),
+    'queue_connection' => env('PURCHASE_QUEUE_CONNECTION', env('QUEUE_CONNECTION', 'redis')),
+    'queue_name'       => env('PURCHASE_QUEUE_NAME', env('QUEUE_NAME', 'orders')),
 
     /*
     |--------------------------------------------------------------------------
-    | Discount Configuration
+    | Retry policy (DLQ)
     |--------------------------------------------------------------------------
-    |
-    | Mystery discount distribution. Weights must be non-negative integers
-    | and are relative; 75/20/5 means ~75% no discount, ~20% ten-percent off,
-    | ~5% fifty-percent off.
-    |
+    | Number of attempts and exponential backoff (in seconds).
+    | After max retries the job's `failed()` hook fires and the order is
+    | marked FAILED with the failure reason persisted.
     */
+    'max_retries' => (int) env('PURCHASE_MAX_RETRIES', 3),
+    'backoff'     => array_map('intval', explode(',', (string) env('PURCHASE_BACKOFF', '5,15,60'))),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Mystery Discount distribution
+    |--------------------------------------------------------------------------
+    | Relative weights. The implementation picks a random int between 0 and
+    | (sum of weights) and maps it to a discount bucket. Defaults to 75/20/5
+    | which yields 0% / 10% / 50% respectively.
+    */
     'discount_weights' => [
-        0  => (int) env('PURCHASE_DISCOUNT_WEIGHT_NONE', 75),
-        10 => (int) env('PURCHASE_DISCOUNT_WEIGHT_TEN', 20),
-        50 => (int) env('PURCHASE_DISCOUNT_WEIGHT_FIFTY', 5),
+        'none'   => (int) env('PURCHASE_DISCOUNT_WEIGHT_NONE', 75),
+        'ten'    => (int) env('PURCHASE_DISCOUNT_WEIGHT_TEN', 20),
+        'fifty'  => (int) env('PURCHASE_DISCOUNT_WEIGHT_FIFTY', 5),
+    ],
+    'discount_values' => [
+        'none'  => 0,
+        'ten'   => 10,
+        'fifty' => 50,
     ],
 
     /*
     |--------------------------------------------------------------------------
-    | Order Queue Connection / Queue
+    | Rate limits (defence in depth alongside the per-user cooldown)
     |--------------------------------------------------------------------------
-    |
-    | ProcessOrder jobs are dispatched here. Defaults to the framework
-    | default but can be overridden for isolation in production.
-    |
+    | Per-user per-minute and per-IP per-minute limits on POST /purchase.
+    | Rotating-email attacks get throttled at the IP layer.
     */
+    'rate_limit' => [
+        'per_minute'      => (int) env('PURCHASE_RATE_LIMIT_PER_MIN', 30),
+        'per_ip_per_min'  => (int) env('PURCHASE_RATE_LIMIT_PER_IP_PER_MIN', 120),
+    ],
 
-    'queue_connection' => env('PURCHASE_QUEUE_CONNECTION', null),
-    'queue_name'       => env('PURCHASE_QUEUE_NAME', null),
+    /*
+    |--------------------------------------------------------------------------
+    | Idempotency
+    |--------------------------------------------------------------------------
+    | Idempotency keys are cached for this long so a retry within the
+    | window returns the same response without re-processing.
+    */
+    'idempotency_ttl' => (int) env('PURCHASE_IDEMPOTENCY_TTL', 24 * 60 * 60),
 ];

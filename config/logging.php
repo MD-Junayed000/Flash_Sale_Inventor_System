@@ -14,7 +14,9 @@ return [
     |
     | This option defines the default log channel that is utilized to write
     | messages to your logs. The value provided here should match one of
-    | the channels present in the list of "channels" configured below.
+    | the channels present in the list of "channels" configured below. We
+    | default to `stack` so production logs go to both the human-readable
+    | single log AND the machine-parseable JSON channel simultaneously.
     |
     */
 
@@ -38,6 +40,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Correlation Logging Toggle
+    |--------------------------------------------------------------------------
+    |
+    | When set to true the CorrelationProcessor injects a `correlation_id`
+    | field into every log record. Disable in isolated unit tests where the
+    | processor would otherwise leak request-scoped state.
+    |
+    */
+    'correlation_enabled' => filter_var(env('LOG_CORRELATION_ENABLED', true), FILTER_VALIDATE_BOOLEAN),
+
+    /*
+    |--------------------------------------------------------------------------
     | Log Channels
     |--------------------------------------------------------------------------
     |
@@ -54,7 +68,7 @@ return [
 
         'stack' => [
             'driver' => 'stack',
-            'channels' => explode(',', env('LOG_STACK', 'single')),
+            'channels' => explode(',', (string) env('LOG_STACK', 'single,json')),
             'ignore_exceptions' => false,
         ],
 
@@ -62,6 +76,29 @@ return [
             'driver' => 'single',
             'path' => storage_path('logs/laravel.log'),
             'level' => env('LOG_LEVEL', 'debug'),
+            'replace_placeholders' => true,
+        ],
+
+        /*
+        |----------------------------------------------------------------------
+        | JSON channel — production structured logs
+        |----------------------------------------------------------------------
+        |
+        | Writes one JSON object per line to storage/logs/json.log. The
+        | JsonChannelFactory taps a CorrelationProcessor that automatically
+        | attaches `correlation_id`, `app_env`, `app_version`, and the request
+        | context to every record.
+        |
+        */
+        'json' => [
+            'driver'    => 'single',
+            'path'      => storage_path('logs/json.log'),
+            'level'     => env('LOG_LEVEL', 'debug'),
+            'tap'       => [\App\Logging\JsonChannelFactory::class],
+            'formatter' => \Monolog\Formatter\JsonFormatter::class,
+            'with'      => [
+                'app_env' => env('APP_ENV', 'production'),
+            ],
             'replace_placeholders' => true,
         ],
 

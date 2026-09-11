@@ -1,9 +1,8 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App\Jobs;
 
+use App\Enums\OrderStatus;
 use App\Models\Order;
 use App\Services\Contracts\PurchaseServiceInterface;
 use Illuminate\Bus\Queueable;
@@ -15,56 +14,119 @@ use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
- * Queue job: process an order after creation (Task 3).
- * Generates invoice, marks order as completed.
- * On failure (Task 4), the order is marked FAILED with the reason.
+ * Queue job that finalises an order after the synchronous stock decrement.
+ *
+ * Why is this a job at all?
+ *   * Decoupling I/O such as payment confirmation, email sending and analytics
+ *     pings from the HTTP request keeps the synchronous part of /purchase under
+ *     50 ms even under flash-sale load.
+ *   * Failed jobs can be retried with exponential backoff ([10s, 30s, 60s]),
+ *     persisted to the failed_jobs table on final failure and re-driven
+ *     manually via `php artisan queue:retry {uuid}`.
+ *
+ * Retries will look like:
+ *   attempts=1  -> process    -> exception   -> wait 10s
+ *   attempts=2  -> process    -> exception   -> wait 30s
+ *   attempts=3  -> process    -> exception   -> failed() (DLQ)
  */
-final class ProcessOrder implements ShouldQueue
+class ProcessOrder implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /** Maximum attempts. After this, failed() handler runs and persists FAILED state. */
+    /** Maximum attempts before the job is moved to the failed_jobs table. */
     public int $tries = 3;
 
-    /** Backoff between attempts (seconds). */
-    public int $backoff = 5;
-
-    /** Max execution time per attempt. */
+    /** Hard ceiling per attempt – guards against runaway jobs. */
     public int $timeout = 30;
+
+    /**
+     * Progressive exponential backoff (seconds) between attempts.
+     * Using a method (not a property) lets us return per-job delays later.
+     *
+     * @return array<int, int>
+     */
+    public function backoff(): array
+    {
+        return [10, 30, 60];
+    }
+
+    /**
+     * Absolute deadline (5 min after dispatch) for "give up and DLQ".
+     * Backoff + tries together guarantee max attempts within the budget.
+     */
+    public function retryUntil(): \DateTime
+    {
+        return now()->addMinutes(5)->toDateTime();
+    }
 
     public function __construct(public readonly int $orderId) {}
 
+    /**
+     * Worker entry-point.
+     *
+     * Idempotent: if the order is no longer Pending (already Completed/Failed),
+     * we short-circuit so that an at-least-once retry cannot double-fulfil.
+     */
     public function handle(PurchaseServiceInterface $purchaseService): void
     {
         /** @var Order|null $order */
         $order = Order::query()->find($this->orderId);
+
         if (! $order) {
-            Log::warning("ProcessOrder: order {$this->orderId} not found");
+            Log::warning('process_order.missing', [
+                'order_id' => $this->orderId,
+                'attempt'  => $this->attempts(),
+            ]);
             return;
         }
 
-        // Idempotency: skip if already in a terminal state
-        if ($order->status !== \App\Enums\OrderStatus::Pending) {
-            Log::info("ProcessOrder: order {$order->id} already in status {$order->status->value}, skipping");
+        if ($order->status !== OrderStatus::Pending) {
+            Log::info('process_order.skipped', [
+                'order_id' => $order->id,
+                'status'   => $order->status->value,
+                'reason'   => 'order_not_pending',
+            ]);
             return;
         }
 
-        // Simulate external processing (e.g., payment gateway, invoice generation)
+        Log::info('process_order.start', [
+            'order_id' => $order->id,
+            'attempt'  => $this->attempts(),
+            'tries'    => $this->tries,
+        ]);
+
         $purchaseService->completeOrder($order);
+
+        Log::info('process_order.complete', [
+            'order_id' => $order->id,
+            'attempt'  => $this->attempts(),
+        ]);
     }
 
     /**
-     * Called once all retries are exhausted.
-     * Persists the FAILED state so the failure reason is visible (Task 4).
+     * Final-failure handler.  Called by the worker when all retries are
+     * exhausted (or when retryUntil() expires).  We mark the order FAILED so
+     * the user sees a clear status and the operator can investigate without
+     * trying to read the queue tables.
      */
     public function failed(Throwable $e): void
     {
+        Log::error('process_order.failed', [
+            'order_id' => $this->orderId,
+            'attempts' => $this->attempts(),
+            'error'    => $e->getMessage(),
+            'class'    => $e::class,
+        ]);
+
         /** @var Order|null $order */
         $order = Order::query()->find($this->orderId);
-        if (! $order) {
-            return;
-        }
+        if ($order && $order->status === OrderStatus::Pending) {
+            $order->status = OrderStatus::Failed;
+            $order->save();
 
-        app(PurchaseServiceInterface::class)->failOrder($order, $e);
+            Log::warning('process_order.marked_failed', [
+                'order_id' => $order->id,
+            ]);
+        }
     }
 }
