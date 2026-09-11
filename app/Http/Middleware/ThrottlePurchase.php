@@ -28,7 +28,7 @@ final class ThrottlePurchase
     public function handle(Request $request, Closure $next): Response
     {
         $key = 'purchase:'.$request->ip().':'.(string) $request->input('sku', '');
-        $maxAttempts = (int) config('purchase.rate_limit_per_ip', 30);
+        $maxAttempts = (int) config('purchase.rate_limit.per_ip_per_min', 120);
 
         if ($this->limiter->tooManyAttempts($key, $maxAttempts)) {
             $retryAfter = $this->limiter->availableIn($key);

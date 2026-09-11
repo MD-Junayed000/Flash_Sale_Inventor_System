@@ -23,13 +23,24 @@ final class DiscountService implements DiscountServiceInterface
 {
     public function roll(): int
     {
-        $roll = random_int(1, 100);
+        $weights = config('purchase.discount_weights', [
+            'none' => 75,
+            'ten' => 20,
+            'fifty' => 5,
+        ]);
+        $values = config('purchase.discount_values', ['none' => 0, 'ten' => 10, 'fifty' => 50]);
+        $total = array_sum($weights);
+        $roll = random_int(1, $total);
+        $cursor = 0;
 
-        return match (true) {
-            $roll <= 20 => 10,    // 20% chance
-            $roll <= 25 => 50,    // 5% chance  (cumulative 20+5)
-            default    => 0,      // 75% chance
-        };
+        foreach ($weights as $bucket => $weight) {
+            $cursor += $weight;
+            if ($roll <= $cursor) {
+                return (int) $values[$bucket];
+            }
+        }
+
+        return 0;
     }
 
     public function calculatePayable(float $unitPrice, int $quantity, int $discountPercentage): float

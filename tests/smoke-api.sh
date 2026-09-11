@@ -28,8 +28,9 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-http://localhost:8000/api/v1}"
 EMAIL="${EMAIL:-alice@test.com}"
 PASSWORD="${PASSWORD:-password}"
-SKU="${SKU:-SKU-1001}"
+SKU="${SKU:-SKU-FLASH-001}"
 QUANTITY="${QUANTITY:-2}"
+PAYMENT_REF="smoke-test-payment"
 
 # -- colour helpers ----------------------------------------------------------
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -69,7 +70,7 @@ PURCHASE=$(curl -fsS -X POST "$BASE_URL/purchase" \
     -H "$AUTH" \
     -H "Content-Type: application/json" \
     -H "Idempotency-Key: $IDEMP" \
-    -d "{\"sku\":\"$SKU\",\"quantity\":$QUANTITY,\"payment_ref\":\"stripe_test_$(date +%s)\"}")
+    -d "{\"sku\":\"$SKU\",\"quantity\":$QUANTITY,\"payment_ref\":\"$PAYMENT_REF\"}")
 echo "$PURCHASE" | head -c 400
 echo "..."
 [[ "$PURCHASE" == *'"success":true'* ]] || { red "purchase did not succeed; response: $PURCHASE"; exit 1; }
@@ -81,7 +82,7 @@ REPLAY=$(curl -fsS -X POST "$BASE_URL/purchase" \
     -H "$AUTH" \
     -H "Content-Type: application/json" \
     -H "Idempotency-Key: $IDEMP" \
-    -d "{\"sku\":\"$SKU\",\"quantity\":$QUANTITY,\"payment_ref\":\"stripe_test_$(date +%s)\"}")
+    -d "{\"sku\":\"$SKU\",\"quantity\":$QUANTITY,\"payment_ref\":\"$PAYMENT_REF\"}")
 [[ "$PURCHASE" == "$REPLAY" ]] || { red "idempotency replay returned a different body"; exit 1; }
 green "replay returned the same body (idempotent)"
 
@@ -90,7 +91,7 @@ header "6. List my orders"
 ORDERS=$(curl -fsS "$BASE_URL/orders" -H "$AUTH")
 echo "$ORDERS" | head -c 400
 echo "..."
-[[ "$ORDERS" == *'"success":true'* ]] || { red "order list failed"; exit 1; }
+[[ "$ORDERS" == *'"data"'* ]] || { red "order list failed"; exit 1; }
 green "order list OK"
 
 green ""

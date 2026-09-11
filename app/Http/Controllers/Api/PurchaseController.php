@@ -84,7 +84,7 @@ final class PurchaseController extends Controller
                 email:          $email,
                 sku:            $validated['sku'],
                 quantity:       (int) $validated['quantity'],
-                paymentRef:     (string) $validated['payment_ref'],
+                paymentRef:     isset($validated['payment_ref']) ? (string) $validated['payment_ref'] : null,
                 idempotencyKey: (string) ($validated['idempotency_key'] ?? (string) Str::uuid()),
                 userId:         $user?->getKey() !== null ? (int) $user->getKey() : null,
             );
@@ -156,7 +156,7 @@ final class PurchaseController extends Controller
         return $request->validate([
             'sku'              => ['required', 'string', 'max:64'],
             'quantity'         => ['required', 'integer', 'min:1', 'max:10'],
-            'payment_ref'      => ['required', 'string', 'min:8', 'max:128'],
+            'payment_ref'      => ['nullable', 'string', 'min:8', 'max:128'],
             'idempotency_key'  => ['nullable', 'string', 'max:128'],
             'email'            => ['nullable', 'email', 'max:191'],
         ]);

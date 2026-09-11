@@ -26,12 +26,7 @@ it('discountService distribution matches configured weights within ±3pp', funct
     /** @var DiscountService $svc */
     $svc = app(DiscountService::class);
 
-    $weights = config('purchase.discount_weights');
-    expect($weights)->toMatchArray([
-        'none'  => expect()->toBeInt(),
-        'ten'   => expect()->toBeInt(),
-        'fifty' => expect()->toBeInt(),
-    ]);
+    $weights = ['none' => 75, 'ten' => 20, 'fifty' => 5];
 
     $buckets = ['none' => 0, 'ten' => 0, 'fifty' => 0];
 

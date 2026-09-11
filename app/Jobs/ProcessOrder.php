@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Enums\OrderStatus;
+use App\Events\OrderCompleted;
 use App\Models\Order;
 use App\Services\Contracts\PurchaseServiceInterface;
 use Illuminate\Bus\Queueable;
@@ -59,7 +60,11 @@ class ProcessOrder implements ShouldQueue
         return now()->addMinutes(5)->toDateTime();
     }
 
-    public function __construct(public readonly int $orderId) {}
+    public function __construct(public readonly int $orderId)
+    {
+        $this->onConnection(config('purchase.queue_connection'));
+        $this->onQueue(config('purchase.queue_name'));
+    }
 
     /**
      * Worker entry-point.
@@ -96,6 +101,7 @@ class ProcessOrder implements ShouldQueue
         ]);
 
         $purchaseService->completeOrder($order);
+        event(new OrderCompleted($order->fresh()));
 
         Log::info('process_order.complete', [
             'order_id' => $order->id,
@@ -122,7 +128,9 @@ class ProcessOrder implements ShouldQueue
         $order = Order::query()->find($this->orderId);
         if ($order && $order->status === OrderStatus::Pending) {
             $order->status = OrderStatus::Failed;
+            $order->failure_reason = $e->getMessage();
             $order->save();
+            event(new OrderCompleted($order->fresh()));
 
             Log::warning('process_order.marked_failed', [
                 'order_id' => $order->id,

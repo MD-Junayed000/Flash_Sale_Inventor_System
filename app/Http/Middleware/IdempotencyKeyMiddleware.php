@@ -30,26 +30,35 @@ final class IdempotencyKeyMiddleware
         }
 
         $userId = optional($request->user())->getAuthIdentifier() ?? 'anon';
-        $cacheKey = 'idem:'.sha1($userId.':'.$request->path().':'.$key);
+        $bodyHash = sha1((string) json_encode($request->all()));
+        $cacheKey = 'idem:'.sha1($userId.':'.$request->path().':'.$key.':'.$bodyHash);
 
-        $cached = Cache::get($cacheKey);
-        if (is_array($cached) && isset($cached['status'], $cached['body'])) {
-            return response()
-                ->json($cached['body'], $cached['status'])
-                ->header('Idempotent-Replay', 'true');
+        $process = function () use ($cacheKey, $next, $request): Response {
+            $cached = Cache::get($cacheKey);
+            if (is_array($cached) && isset($cached['status'], $cached['body'])) {
+                return response()
+                    ->json($cached['body'], $cached['status'])
+                    ->header('Idempotent-Replay', 'true');
+            }
+
+            /** @var Response $response */
+            $response = $next($request);
+
+            // Only cache 2xx — errors should be retryable.
+            if ($response->isSuccessful()) {
+                Cache::put($cacheKey, [
+                    'status' => $response->getStatusCode(),
+                    'body'   => $response->getOriginalContent(),
+                ], now()->addSeconds((int) config('purchase.idempotency_ttl', 86_400)));
+            }
+
+            return $response;
+        };
+
+        if (Cache::getStore() instanceof LockProvider) {
+            return Cache::lock($cacheKey.':lock', 30)->block(5, $process);
         }
 
-        /** @var Response $response */
-        $response = $next($request);
-
-        // Only cache 2xx — errors should be retryable.
-        if ($response->getStatusCode() < 500) {
-            Cache::put($cacheKey, [
-                'status' => $response->getStatusCode(),
-                'body'   => $response->getOriginalContent(),
-            ], now()->addSeconds((int) config('purchase.idempotency_ttl', 86_400)));
-        }
-
-        return $response;
+        return $process();
     }
 }

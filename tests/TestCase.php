@@ -3,11 +3,18 @@
 namespace Tests;
 
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
-use Illuminate\Foundation\Testing\CreatesApplication;
+use Illuminate\Contracts\Console\Kernel;
 
 abstract class TestCase extends BaseTestCase
 {
-    use CreatesApplication;
+    public function createApplication()
+    {
+        $app = require dirname(__DIR__).'/bootstrap/app.php';
+
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
 
     /**
      * Helper: register and authenticate a user via the v1 API and return
@@ -21,7 +28,7 @@ abstract class TestCase extends BaseTestCase
             'name'     => 'Test User',
             'email'    => $email,
             'password' => $password,
-        ])->assertOk();
+        ])->assertCreated();
 
         $login = $this->postJson('/api/v1/auth/login', [
             'email'    => $email,

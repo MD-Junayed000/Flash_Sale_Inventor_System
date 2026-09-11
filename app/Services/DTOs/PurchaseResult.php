@@ -14,9 +14,7 @@ use App\Models\Order;
  * integer cents over floats to avoid floating-point drift both server-side
  * and on JS clients when they sum totals.
  *
- * The DTO is the only contract between the service layer and the HTTP layer.
- * It deliberately DOES NOT expose the Order model directly to keep the
- * interface testable and to prevent accidental coupling to Eloquent.
+ * The DTO is the contract between the service layer and the HTTP layer.
  */
 final readonly class PurchaseResult
 {
@@ -30,6 +28,7 @@ final readonly class PurchaseResult
         public ?int          $unitPrice         = null,   // cents
         public ?int          $payableAmount     = null,   // cents
         public ?int          $discountPercentage = null,
+        public ?Order        $order             = null,
         public ?string       $errorCode         = null,
         public array         $context           = [],
     ) {
@@ -56,6 +55,7 @@ final readonly class PurchaseResult
             unitPrice:          $unitPriceCents,
             payableAmount:      $payableCents,
             discountPercentage: (int) ($order->discount_percentage ?? 0),
+            order:              $order,
         );
     }
 
@@ -95,7 +95,9 @@ final readonly class PurchaseResult
         if ($this->success) {
             $payload['data'] = [
                 'order_id'            => $this->orderId,
-                'order_uuid'          => $this->orderUuid,
+                'invoice_number'      => $this->order?->invoice_number,
+                'sku'                 => $this->order?->sku,
+                'quantity'            => $this->order?->quantity,
                 'status'              => $this->status?->value,
                 'unit_price_cents'    => $this->unitPrice,
                 'payable_amount_cents' => $this->payableAmount,

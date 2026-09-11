@@ -21,6 +21,7 @@ use App\Services\DTOs\PurchaseResult;
 use Illuminate\Contracts\Cache\Repository as CacheContract;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use Throwable;
 
 /**
@@ -69,16 +70,28 @@ final class PurchaseService implements PurchaseServiceInterface
         ?string $idempotencyKey = null,
         ?int    $userId         = null,
     ): PurchaseResult {
-        // 1. Cooldown check — cheap and out-of-transaction.
         $cooldownKey = $this->cooldownKey($email, $sku);
-        if ($this->cache->has($cooldownKey)) {
-            $this->logFailure($email, $sku, $quantity, 'cooldown_active');
+        $store = config('purchase.cooldown_store');
+        $cache = $store ? Cache::store($store) : $this->cache;
 
-            throw new PurchaseCooldownException($email, $sku);
-        }
+        $attempt = function () use (
+            $cache,
+            $cooldownKey,
+            $email,
+            $sku,
+            $quantity,
+            $paymentRef,
+            $idempotencyKey,
+            $userId,
+        ): PurchaseResult {
+            if ($cache->has($cooldownKey)) {
+                $this->logFailure($email, $sku, $quantity, 'cooldown_active');
 
-        try {
-            $order = DB::transaction(function () use ($email, $sku, $quantity, $paymentRef, $idempotencyKey, $userId) {
+                throw new PurchaseCooldownException($email, $sku);
+            }
+
+            try {
+                $order = DB::transaction(function () use ($email, $sku, $quantity, $paymentRef, $idempotencyKey, $userId) {
                 /** @var Product|null $product */
                 $product = Product::query()
                     ->where('sku', $sku)
@@ -109,59 +122,55 @@ final class PurchaseService implements PurchaseServiceInterface
                     $discount,
                 );
 
-                return Order::create([
-                    'product_id'          => $product->id,
-                    'user_email'          => $email,
-                    'user_id'             => $userId,
-                    'sku'                 => $sku,
-                    'quantity'            => $quantity,
-                    'unit_price'          => $product->price,
-                    'discount_percentage' => $discount,
-                    'payable_amount'      => $payable,
-                    'payment_ref'         => $paymentRef,
-                    'idempotency_key'     => $idempotencyKey,
-                    'status'              => OrderStatus::Pending,
+                    return Order::create([
+                        'product_id'          => $product->id,
+                        'user_email'          => $email,
+                        'user_id'             => $userId,
+                        'sku'                 => $sku,
+                        'quantity'            => $quantity,
+                        'unit_price'          => $product->price,
+                        'discount_percentage' => $discount,
+                        'payable_amount'      => $payable,
+                        'payment_ref'         => $paymentRef,
+                        'idempotency_key'     => $idempotencyKey,
+                        'status'              => OrderStatus::Pending,
+                    ]);
+                });
+            } catch (ProductNotFoundException|InactiveProductException|InsufficientStockException $e) {
+                $this->logFailure($email, $sku, $quantity, $e::class);
+
+                throw $e;
+            } catch (PurchaseCooldownException $e) {
+                throw $e;
+            } catch (Throwable $e) {
+                $this->logFailure($email, $sku, $quantity, 'unexpected_error');
+                Log::error('purchase.unexpected', [
+                    'email'    => $email,
+                    'sku'      => $sku,
+                    'quantity' => $quantity,
+                    'error'    => $e->getMessage(),
+                    'class'    => $e::class,
                 ]);
-            });
-        } catch (ProductNotFoundException|InactiveProductException|InsufficientStockException|PurchaseCooldownException $e) {
-            // Domain failures re-throw so the controller can map them.
-            throw $e;
-        } catch (Throwable $e) {
-            Log::error('purchase.unexpected', [
-                'email'    => $email,
-                'sku'      => $sku,
-                'quantity' => $quantity,
-                'error'    => $e->getMessage(),
-                'class'    => $e::class,
-            ]);
 
-            // Generic surface — do not leak internals to the client.
-            throw new \RuntimeException('Could not process purchase.', 0, $e);
-        }
-
-        // Cooldown only AFTER successful purchase so a failure does not lock out the user.
-        $ttl = (int) config('purchase.cooldown_seconds', 60);
-        if ($ttl > 0) {
-            $store = config('purchase.cooldown_store');
-            if ($store !== null && $store !== '') {
-                \Illuminate\Support\Facades\Cache::store($store)
-                    ->put($cooldownKey, true, $ttl);
-            } else {
-                $this->cache->put($cooldownKey, true, $ttl);
+                throw new \RuntimeException('Could not process purchase.', 0, $e);
             }
+
+            $ttl = (int) config('purchase.cooldown_seconds', 60);
+            if ($ttl > 0) {
+                $cache->put($cooldownKey, true, $ttl);
+            }
+
+            ProcessOrder::dispatch($order->id);
+            $this->logSuccess($email, $sku, $quantity);
+
+            return PurchaseResult::ok($order);
+        };
+
+        if ($cache->getStore() instanceof LockProvider) {
+            return $cache->lock($cooldownKey.':lock', 10)->block(5, $attempt);
         }
 
-        ProcessOrder::dispatch($order->id);
-        $this->logSuccess($email, $sku, $quantity);
-
-        return PurchaseResult::ok(
-            orderId:            $order->id,
-            orderUuid:          $order->invoice_number ?? '',
-            status:             $order->status->value,
-            unitPrice:          (float) $order->unit_price,
-            payableAmount:      (float) $order->payable_amount,
-            discountPercentage: (int) $order->discount_percentage,
-        );
+        return $attempt();
     }
 
     public function completeOrder(Order $order): void
