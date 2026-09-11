@@ -47,6 +47,10 @@ The first startup builds the PHP 8.4 image and starts:
 | `db`        | MySQL 8                                | `localhost:3306`        |
 | `redis`     | Cache, locks, and queues               | `localhost:6379`        |
 
+It should look like this:
+
+![Flash Sale product management page](image/product.png)
+
 Check that the application and dependencies are ready:
 
 ```bash
@@ -61,14 +65,26 @@ Expected health response:
 { "status": "ok" }
 ```
 
-The seeded login is:
+The seeder creates three demo users:
 
 ```text
-Email:    alice@test.com
-Password: password
+alice@test.com  / password
+bob@test.com    / password
+flash@test.com  / password
 ```
 
 Seeded products include `SKU-FLASH-001` and `SKU-FLASH-002`.
+
+These credentials are for local demonstration only. They are created in
+`database/seeders/DatabaseSeeder.php`. To change them permanently, edit the
+user list in that file and run:
+
+```bash
+docker compose exec app php artisan db:seed --force
+```
+
+To create a new user without editing seed data, use the public registration
+endpoint described below. Do not use the demo password in production.
 
 ## 3. Environment configuration
 
@@ -205,11 +221,110 @@ Column details:
 - `activity_logs` stores one row for each purchase attempt, including failed attempts and their reason.
 - `jobs` and `failed_jobs` are Laravel queue tables. Redis is the active queue transport in Docker; these tables remain available for Laravel queue tooling and failed-job persistence configuration.
 
+### Table relationships
+
+```mermaid
+erDiagram
+  USERS ||--o{ ORDERS : places
+  USERS ||--o{ PERSONAL_ACCESS_TOKENS : owns
+  PRODUCTS ||--o{ ORDERS : contains
+
+  USERS {
+    bigint id PK
+    string name
+    string email UK
+    string password
+  }
+  PRODUCTS {
+    bigint id PK
+    string sku UK
+    string name
+    decimal price
+    int stock_quantity
+    enum status
+  }
+  ORDERS {
+    bigint id PK
+    bigint product_id FK
+    bigint user_id FK "nullable"
+    string user_email
+    string sku
+    int quantity
+    decimal unit_price
+    tinyint discount_percentage
+    decimal payable_amount
+    string invoice_number UK "nullable"
+    enum status
+    text failure_reason "nullable"
+  }
+  PERSONAL_ACCESS_TOKENS {
+    bigint id PK
+    string tokenable_type
+    bigint tokenable_id FK
+    string name
+    string token UK
+  }
+  ACTIVITY_LOGS {
+    bigint id PK
+    string email "nullable"
+    string sku "nullable"
+    int quantity "nullable"
+    enum status
+    text failure_reason "nullable"
+  }
+  JOBS {
+    bigint id PK
+    string queue
+    text payload
+  }
+  FAILED_JOBS {
+    bigint id PK
+    string uuid UK
+    text payload
+    text exception
+  }
+```
+
+`orders.product_id` is a foreign key to `products.id` and is deleted with the
+product. `orders.user_id` is nullable and is set to null if the user is
+deleted; `user_email` remains as an audit snapshot. Sanctum connects users to
+`personal_access_tokens` through Laravel's polymorphic `tokenable_type` and
+`tokenable_id` columns. Activity logs intentionally have no foreign keys:
+they preserve the original purchase attempt even if a product or user is
+later removed. Queue records are operational payloads rather than business
+relationships.
+
 ## 6. API usage
 
 All API routes use the `/api/v1` prefix. Protected routes require a Sanctum bearer token.
 
 ### Register and login
+
+For a new local account, register first:
+
+**Bash / macOS / Linux:**
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/auth/register \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Demo Buyer","email":"buyer@example.com","password":"password"}'
+```
+
+**PowerShell:** use `curl.exe` and a backtick for line continuation, or keep
+the command on one line:
+
+```powershell
+curl.exe -i -X POST http://localhost:8000/api/v1/auth/register `
+  -H "Accept: application/json" `
+  -H "Content-Type: application/json" `
+  -d '{"name":"Demo Buyer","email":"buyer@example.com","password":"password"}'
+```
+
+Registration returns `201 Created` and a token immediately. The email must be
+unique and the password must contain at least 8 characters.
+
+To use the seeded account, login as follows.
 
 ```bash
 curl -i -X POST http://localhost:8000/api/v1/auth/login \
@@ -217,6 +332,21 @@ curl -i -X POST http://localhost:8000/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"alice@test.com","password":"password"}'
 ```
+
+The equivalent **PowerShell** command is:
+
+```powershell
+curl.exe -i -X POST http://localhost:8000/api/v1/auth/login `
+  -H "Accept: application/json" `
+  -H "Content-Type: application/json" `
+  -d '{"email":"alice@test.com","password":"password"}'
+```
+
+PowerShell does not use `\` to continue a command. With `\`, the first line
+is sent without the headers/body and the following lines are treated as new
+PowerShell commands. That is why the original attempt showed a redirect and
+`Bad hostname` errors. A correct login returns `HTTP/1.1 200 OK` with a JSON
+object containing `user` and `token`.
 
 The response contains `token`. Export it for the following commands:
 
@@ -238,6 +368,14 @@ curl -s http://localhost:8000/api/v1/products \
   -H 'Accept: application/json'
 ```
 
+PowerShell:
+
+```powershell
+curl.exe -s http://localhost:8000/api/v1/products `
+  -H "Authorization: Bearer $TOKEN" `
+  -H "Accept: application/json"
+```
+
 Expected: a `data` collection containing active products and `stock_quantity`.
 
 ### Purchase a product
@@ -250,6 +388,17 @@ curl -i -X POST http://localhost:8000/api/v1/purchase \
   -H 'Accept: application/json' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo-purchase-001' \
+  -d '{"sku":"SKU-FLASH-001","quantity":2}'
+```
+
+PowerShell:
+
+```powershell
+curl.exe -i -X POST http://localhost:8000/api/v1/purchase `
+  -H "Authorization: Bearer $TOKEN" `
+  -H "Accept: application/json" `
+  -H "Content-Type: application/json" `
+  -H "Idempotency-Key: demo-purchase-001" `
   -d '{"sku":"SKU-FLASH-001","quantity":2}'
 ```
 
@@ -301,6 +450,14 @@ curl -s http://localhost:8000/api/v1/orders \
   -H "Authorization: Bearer $TOKEN"
 
 curl -s http://localhost:8000/api/v1/ready
+```
+
+PowerShell:
+
+```powershell
+curl.exe -s http://localhost:8000/api/v1/orders `
+  -H "Authorization: Bearer $TOKEN"
+curl.exe -s http://localhost:8000/api/v1/ready
 ```
 
 `/ready` checks the database, cache, and queue configuration. It returns `200` with `"status":"ready"` when dependencies are available.
