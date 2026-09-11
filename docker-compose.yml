@@ -1,196 +1,178 @@
 services:
-  app:
-    image: flash-sale-php:latest
-    container_name: flash-sale-app
-    working_dir: /var/www/html
-    volumes:
-      - ./:/var/www/html
-    ports:
-      - "8000:8000"
-    environment:
-      DB_CONNECTION: mysql
-      DB_HOST: db
-      DB_PORT: 3306
-      DB_DATABASE: flash_sale
-      DB_USERNAME: sail
-      DB_PASSWORD: password
-      DB_READ_HOST: db-replica
-      DB_READ_PORT: 3306
-      CACHE_STORE: redis
-      CACHE_PREFIX: flash_sale
-      REDIS_CLIENT: predis
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_PASSWORD: null
-      QUEUE_CONNECTION: redis
-      QUEUE_NAME: orders
-      LOG_CHANNEL: stack
-      LOG_LEVEL: info
-      LOG_CORRELATION_ENABLED: "true"
-      APP_ENV: local
-      APP_KEY: base64:placeholder_replace_with_artisan_key_generate
-    command: >
-      sh -c "php artisan config:clear && php artisan serve --host=0.0.0.0 --port=8000"
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - flash-sale-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
+    app:
+        image: flash-sale-php:latest
+        build:
+            context: .
+            dockerfile: docker/php/Dockerfile
+        container_name: flash-sale-app
+        working_dir: /var/www/html
+        volumes:
+            - ./:/var/www/html
+        ports:
+            - "8000:8000"
+        environment:
+            DB_CONNECTION: mysql
+            DB_HOST: db
+            DB_PORT: 3306
+            DB_DATABASE: flash_sale
+            DB_USERNAME: sail
+            DB_PASSWORD: password
+            CACHE_STORE: redis
+            CACHE_PREFIX: flash_sale
+            REDIS_CLIENT: predis
+            REDIS_HOST: redis
+            REDIS_PORT: 6379
+            REDIS_PASSWORD: null
+            QUEUE_CONNECTION: redis
+            QUEUE_NAME: orders
+            LOG_CHANNEL: stack
+            LOG_LEVEL: info
+            LOG_CORRELATION_ENABLED: "true"
+            APP_ENV: local
+            APP_KEY: base64:placeholder_replace_with_artisan_key_generate
+        command: >
+            sh -c "php artisan config:clear && php artisan serve --host=0.0.0.0 --port=8000"
+        depends_on:
+            db:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+        networks:
+            - flash-sale-net
+        healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+            interval: 10s
+            timeout: 5s
+            retries: 6
 
-  worker:
-    image: flash-sale-php:latest
-    container_name: flash-sale-worker
-    working_dir: /var/www/html
-    volumes:
-      - ./:/var/www/html
-    environment:
-      DB_CONNECTION: mysql
-      DB_HOST: db
-      DB_DATABASE: flash_sale
-      DB_USERNAME: sail
-      DB_PASSWORD: password
-      CACHE_STORE: redis
-      REDIS_CLIENT: predis
-      REDIS_HOST: redis
-      QUEUE_CONNECTION: redis
-      QUEUE_NAME: orders
-      LOG_CHANNEL: stack
-      LOG_CORRELATION_ENABLED: "true"
-    command: >
-      sh -c "php artisan queue:work redis --queue=orders --tries=3 --backoff=5,15,60 --sleep=1 --timeout=60 --max-time=3600"
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      app:
-        condition: service_started
-    networks:
-      - flash-sale-net
-    restart: unless-stopped
+    worker:
+        image: flash-sale-php:latest
+        build:
+            context: .
+            dockerfile: docker/php/Dockerfile
+        container_name: flash-sale-worker
+        working_dir: /var/www/html
+        volumes:
+            - ./:/var/www/html
+        environment:
+            DB_CONNECTION: mysql
+            DB_HOST: db
+            DB_DATABASE: flash_sale
+            DB_USERNAME: sail
+            DB_PASSWORD: password
+            CACHE_STORE: redis
+            REDIS_CLIENT: predis
+            REDIS_HOST: redis
+            QUEUE_CONNECTION: redis
+            QUEUE_NAME: orders
+            LOG_CHANNEL: stack
+            LOG_CORRELATION_ENABLED: "true"
+        command: >
+            sh -c "php artisan queue:work redis --queue=orders --tries=3 --backoff=5,15,60 --sleep=1 --timeout=60 --max-time=3600"
+        depends_on:
+            db:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+            app:
+                condition: service_started
+        networks:
+            - flash-sale-net
+        restart: unless-stopped
 
-  scheduler:
-    image: flash-sale-php:latest
-    container_name: flash-sale-scheduler
-    working_dir: /var/www/html
-    volumes:
-      - ./:/var/www/html
-    environment:
-      DB_CONNECTION: mysql
-      DB_HOST: db
-      DB_DATABASE: flash_sale
-      DB_USERNAME: sail
-      DB_PASSWORD: password
-      CACHE_STORE: redis
-      REDIS_CLIENT: predis
-      REDIS_HOST: redis
-      QUEUE_CONNECTION: redis
-      LOG_CHANNEL: stack
-    command: >
-      sh -c "while true; do php artisan schedule:run --no-interaction; sleep 60; done"
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - flash-sale-net
-    restart: unless-stopped
+    scheduler:
+        image: flash-sale-php:latest
+        build:
+            context: .
+            dockerfile: docker/php/Dockerfile
+        container_name: flash-sale-scheduler
+        working_dir: /var/www/html
+        volumes:
+            - ./:/var/www/html
+        environment:
+            DB_CONNECTION: mysql
+            DB_HOST: db
+            DB_DATABASE: flash_sale
+            DB_USERNAME: sail
+            DB_PASSWORD: password
+            CACHE_STORE: redis
+            REDIS_CLIENT: predis
+            REDIS_HOST: redis
+            QUEUE_CONNECTION: redis
+            LOG_CHANNEL: stack
+        command: >
+            sh -c "while true; do php artisan schedule:run --no-interaction; sleep 60; done"
+        depends_on:
+            db:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+        networks:
+            - flash-sale-net
+        restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    container_name: flash-sale-redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
-    ports:
-      - "6379:6379"
-    volumes:
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      retries: 10
-      interval: 5s
-      timeout: 3s
-    networks:
-      - flash-sale-net
+    redis:
+        image: redis:7-alpine
+        container_name: flash-sale-redis
+        restart: unless-stopped
+        command:
+            [
+                "redis-server",
+                "--appendonly",
+                "yes",
+                "--maxmemory",
+                "256mb",
+                "--maxmemory-policy",
+                "allkeys-lru",
+            ]
+        ports:
+            - "6379:6379"
+        volumes:
+            - redisdata:/data
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            retries: 10
+            interval: 5s
+            timeout: 3s
+        networks:
+            - flash-sale-net
 
-  db:
-    image: mysql:8.0
-    container_name: flash-sale-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: flash_sale
-      MYSQL_USER: sail
-      MYSQL_PASSWORD: password
-    ports:
-      - "3306:3306"
-    volumes:
-      - dbdata:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
-      retries: 10
-      interval: 5s
-      timeout: 5s
-    networks:
-      - flash-sale-net
-
-  db-replica:
-    image: mysql:8.0
-    container_name: flash-sale-mysql-replica
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: flash_sale
-      MYSQL_USER: sail
-      MYSQL_PASSWORD: password
-    ports:
-      - "3307:3306"
-    volumes:
-      - replicadata:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
-      retries: 10
-      interval: 5s
-      timeout: 5s
-    networks:
-      - flash-sale-net
-
-  # Hourly MySQL backups to a named volume (run via scheduler + cron command).
-  backup:
-    image: mysql:8.0
-    container_name: flash-sale-mysql-backup
-    restart: unless-stopped
-    volumes:
-      - backupdata:/backup
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: flash_sale
-    entrypoint: >
-      sh -c "echo '0 * * * * mysqldump -h db -uroot -proot --single-transaction --routines --triggers flash_sale | gzip > /backup/flash_sale_$$(date +\\%Y\\%m\\%d_\\%H\\%M).sql.gz' > /etc/crontabs/root && crond -f -L /dev/stdout"
-    depends_on:
-      db:
-        condition: service_healthy
-    networks:
-      - flash-sale-net
+    db:
+        image: mysql:8.0
+        container_name: flash-sale-mysql
+        restart: unless-stopped
+        environment:
+            MYSQL_ROOT_PASSWORD: root
+            MYSQL_DATABASE: flash_sale
+            MYSQL_USER: sail
+            MYSQL_PASSWORD: password
+        ports:
+            - "3306:3306"
+        volumes:
+            - dbdata:/var/lib/mysql
+        healthcheck:
+            test:
+                [
+                    "CMD",
+                    "mysqladmin",
+                    "ping",
+                    "-h",
+                    "localhost",
+                    "-uroot",
+                    "-proot",
+                ]
+            retries: 10
+            interval: 5s
+            timeout: 5s
+        networks:
+            - flash-sale-net
 
 volumes:
-  dbdata:
-    driver: local
-  replicadata:
-    driver: local
-  redisdata:
-    driver: local
-  backupdata:
-    driver: local
+    dbdata:
+        driver: local
+    redisdata:
+        driver: local
 
 networks:
-  flash-sale-net:
-    driver: bridge
+    flash-sale-net:
+        driver: bridge

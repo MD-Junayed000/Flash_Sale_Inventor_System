@@ -1,298 +1,175 @@
-# EXPLAIN.md — Decisions, Trade-offs, and Rationale
+# Implementation Notes
 
-This document captures **what** was built, **why** each architectural decision was made, and **what was rejected**. It is intended as a code-review companion to `README.md`: the README explains *how to run* the system, this file explains *why it is built this way*.
+This document explains the important decisions in the Flash Sale Inventory System in plain language. The goal is to make the code easy to review and easy for a junior developer to explain during the hiring test.
 
-> Targeted at the Laravel Junior Developer Hiring Test (8-hour challenge). Every choice below was made with three constraints in mind: **clarity first**, **production-realism**, and **minimum moving parts**.
+## 1. What the system guarantees
 
----
+A purchase is accepted only when:
 
-## 1. Tech Stack
+1. The caller has a valid Sanctum token.
+2. The request contains a valid SKU and a quantity from 1 to 10.
+3. The product exists and is active.
+4. Enough stock can be reserved inside a database transaction.
+5. An order can be written successfully.
 
-| Concern | Choice | Why this, not something else |
-|---|---|---|
-| Framework | **Laravel 11.31** | Brief said "Laravel 10+" so 11 is allowed; it's the current LTS line and ships with cleaner DI / routing than 10. |
-| PHP | **8.4** | Required by Laravel 11. Matches the official `php:8.4-cli` Docker image. |
-| Database | **MySQL 8.0** | Brief explicitly required MySQL (not Postgres / SQLite). |
-| Queue driver | **Database** | No Redis was required. Database queue is portable and ships with Laravel; every queued job is a row, which is also easy to inspect in tests. |
-| Cache driver | **File** | Used for the per-(user, sku) cooldown lock. File cache works inside a single web container; if we ever scale to multi-instance web tier, we just flip `CACHE_STORE=redis` — no code change. |
-| Web server | **`php artisan serve`** | Single-process `php -S` inside the `app` container is enough for the assessment; in production we'd front it with Nginx + PHP-FPM, which is already how the Dockerfile is structured. |
-| Container | **Custom Docker Compose** | The brief mentioned "Docker"; Laravel Sail was considered but it locks the user into the Sail image and CLI wrapper. A custom 4-service Compose stack (`app`, `worker`, `scheduler`, `db`) is more transparent and easier to read. |
-| Auth | **None — header-based** | The brief said "Bonus: track activity per user". Implementing Sanctum/Passport would consume half the budget. We use `X-User-Email` as a stable identifier. Adding auth later only requires swapping `Request::header('X-User-Email')` for `auth()->id()`. |
+After acceptance, the customer receives an order ID immediately. A queue worker later creates the invoice and completes the order.
 
----
+The main invariant is:
 
-## 2. Architecture: Three Layers
-
-```
-HTTP layer  →  Domain layer  →  Data layer
-(Controller)    (Service)        (Eloquent Model + DB)
+```text
+successful order quantity <= starting stock
 ```
 
-### Why a Service Layer?
+That invariant is more important than the response speed or the discount feature.
 
-- **Testability.** `PurchaseService` can be unit-tested without booting the HTTP kernel, building a request, or routing.
-- **Reusability.** The same `PurchaseService::attempt(...)` flow runs from (a) the API controller, and (b) the concurrency simulation command. No duplication.
-- **Thin controllers.** `Api\PurchaseController` is exactly 22 lines. It validates input, calls the service, and translates the result into an HTTP response. That's all a controller should do.
-- **Interface-driven.** `PurchaseServiceInterface` lets us mock the service in tests, and lets us swap implementations later (e.g., a `CachedPurchaseService` decorator) without touching the controller.
+## 2. Why the project uses these components
 
-### Why *not* use Laravel Sail?
+### Laravel
 
-Sail adds an extra abstraction (its own `sail` shell wrapper, its own Dockerfile generation via `sail:install`). For an 8-hour assessment, a plain `docker-compose.yml` is faster to read, faster to debug, and the reviewer doesn't have to know Sail's quirks to follow it.
+Laravel supplies routing, validation, authentication, database transactions, queues, migrations, and testing conventions. Using those framework features keeps the implementation understandable and avoids custom infrastructure for common problems.
 
-### Why *not* put logic directly into the model?
+### MySQL
 
-"Fat models" (e.g. `Product::purchase($email, $qty)`) are common in small Laravel apps, but they couple business rules (cooldown, discount, activity logging) to the data layer. Two problems:
-1. The model ends up depending on the cache, the queue, the discount service — every consumer pulls all of that in.
-2. You can't compose behaviour (e.g. add a "vip-customer bypass cooldown" rule) without editing the model.
+The challenge specifically requires MySQL. InnoDB row locks and transactions make it suitable for reserving scarce inventory safely.
 
-A service layer keeps models as pure data + a couple of helpers (`Product::decrementStock`).
+### Redis
 
----
+Redis is used for three fast, shared operations:
 
-## 3. Concurrency: Why an Atomic Conditional UPDATE?
+- Cooldown keys with expiry
+- Short-lived distributed locks
+- The order queue
 
-The whole "flash sale" pitch is "many users, one product, few units". Race conditions are the headline risk. The brief explicitly required preventing overselling.
+The queue and cache are separate logical uses even though they share one Redis service. In production they can be separated if capacity or failure isolation requires it.
 
-### What was rejected
+### Sanctum
 
-| Approach | Why rejected |
-|---|---|
-| `Product::find($id)->update(['stock' => $stock - $qty])` | Classic **lost-update** bug. Two concurrent transactions both read `stock=1`, both compute `stock=0`, both write `stock=0`. Result: sold 2 against 1 unit. |
-| `DB::transaction(fn() => Product::lockForUpdate()->find($id)->decrement(...))` | Works, but pessimistically serializes **every** purchase on a SKU. A flash sale with 50k concurrent buyers on 1 SKU creates a queue at the DB. Latency, not correctness, becomes the bottleneck. |
-| Redis `WATCH`/`MULTI`/`EXEC` | Adds a new infrastructure dependency for an 8-hour test. The brief did not require Redis. |
-| Application-level mutex (`Cache::lock()`) | Adds another network hop, and the lock itself becomes a SPOF. |
+The API uses bearer tokens instead of trusting an email header. A client cannot simply change an `X-User-Email` value to act as another customer. The authenticated user's email is copied into the activity log and order for auditability.
 
-### What we ship — single SQL statement
+### Blade
 
-```php
-$affected = DB::table('products')
-    ->where('id', $product->id)
-    ->where('stock_quantity', '>=', $quantity)
-    ->update([
-        'stock_quantity' => DB::raw("stock_quantity - {$quantity}"),
-        'updated_at'     => now(),
-    ]);
+The challenge excludes Livewire and Inertia. Blade provides a simple server-rendered product CRUD interface without adding a second frontend application.
 
-if ($affected === 0) {
-    throw new InsufficientStockException(...);
-}
+## 3. Purchase service design
+
+`PurchaseService` is the business boundary. The controller does not decide stock rules, discount rules, or queue behavior.
+
+The service performs these operations:
+
+1. Acquire a short Redis lock for the customer/SKU pair.
+2. Reject an active cooldown.
+3. Start a database transaction.
+4. Find the product with `SELECT ... FOR UPDATE`.
+5. Reject missing or inactive products.
+6. Decrement stock with a conditional update.
+7. Calculate and store the mystery discount.
+8. Insert a pending order.
+9. Commit the transaction.
+10. Write the cooldown key, dispatch `ProcessOrder`, and record the successful activity attempt.
+
+Known domain failures are converted into typed exceptions. The controller maps those exceptions to consistent HTTP responses.
+
+## 4. Why stock cannot be oversold
+
+The product row is locked while the transaction is active, and the stock update includes its own guard:
+
+```sql
+UPDATE products
+SET stock_quantity = stock_quantity - :quantity
+WHERE id = :product_id
+  AND stock_quantity >= :quantity;
 ```
 
-**Why this works:**
-- The `WHERE stock_quantity >= quantity` predicate is checked **inside the same row lock** that MySQL takes for any `UPDATE`. Two concurrent UPDATEs cannot both observe a stock count that satisfies the predicate — the row lock serializes them.
-- If the predicate fails, MySQL reports `0 rows affected`; we translate that into a domain exception.
-- One round-trip, one lock, no application-side coordination. Throughput is limited only by the DB's update rate, not by an in-process queue.
-- **Verified empirically**: `php artisan purchase:simulate --stock=3 --users=10 --qty=2` → 1 succeeds, 9 fail with HTTP 400, final `stock = 1`. Zero overselling.
+If the update affects zero rows, the service throws `InsufficientStockException`. If the order insert or another transaction step fails, the database rolls back the decrement.
 
-### Why this is also correct under transactions
+The row lock protects the read/validate/write sequence. The conditional update is a second defense and makes the invariant explicit at the database boundary.
 
-The whole purchase flow runs inside `DB::transaction(...)`. If anything else throws (e.g. the order insert fails), MySQL rolls back the UPDATE, so the stock decrement is undone. The `decrementStock` helper is `static::query()` (not the model instance) precisely so it bypasses any model events and emits a raw SQL update that participates in the surrounding transaction.
+A real production load test should use multiple HTTP workers and MySQL, not only sequential test calls. The application logic is designed for that race: all competing buyers update the same product row through the database lock.
 
----
+## 5. Cooldown and idempotency
 
-## 4. Cooldown Lock: Why a TTL Cache Key?
+These are different protections:
 
-### What we ship
+- **Cooldown:** the same customer cannot buy the same SKU again for 60 seconds.
+- **Idempotency:** a retried request with the same `Idempotency-Key` returns the original successful response instead of creating another order.
 
-```php
-Cache::put("cooldown:{$email}:{$sku}", true, config('purchase.cooldown_seconds'));
-```
+Both use Redis locks so the check and write cannot be separated by a competing request. Idempotency also includes the request body in its cache key; reusing a key for a different body does not replay the previous body.
 
-`Cache::has(...)` is checked at the top of `PurchaseService::attempt`. If the key exists, we throw `PurchaseCooldownException` → controller returns **HTTP 429**.
+Only successful HTTP responses are cached for idempotency. Validation and business failures remain retryable.
 
-### Why this, not alternatives?
+## 6. Transactions and queue timing
 
-| Alternative | Why rejected |
-|---|---|
-| Database table `cooldowns(user, sku, expires_at)` | Two extra writes per purchase (insert + delete), and you have to write a cleanup job. Cache with TTL does this for free. |
-| Redis `SET key value NX EX 60` | Fast, but only works when `CACHE_STORE=redis`. Our default `file` driver also implements `add()` semantics via the cache repository, so the same code path works on either backend. |
-| Laravel `RateLimiter` | Works, but couples the rule to the HTTP layer. We want the cooldown to be a *domain* rule — it must apply to the simulation command too, not just to the controller. |
-| Middleware-only | Same problem as RateLimiter — domain rule expressed in HTTP layer. |
+Stock and the pending order are written in one database transaction. The queue dispatch occurs after the transaction callback completes, so the worker cannot normally see an uncommitted order.
 
-The key is namespaced as `cooldown:{email}:{sku}` — **one entry per (user, sku) pair**. Different users buying the same SKU do not block each other; the same user buying two different SKUs does not block themselves.
+The order deliberately starts as `pending`. `ProcessOrder` then:
 
----
+- Generates an invoice number from the order ID and current date.
+- Changes the order to `completed`.
+- Dispatches `OrderCompleted`.
 
-## 5. Queue: Why Database, and Why a Separate `ProcessOrder` Job?
+If all retries fail, Laravel writes the job to `failed_jobs`; the job also changes the order to `failed` and stores the exception message in `failure_reason`.
 
-### Why database queue?
+This is a reserve-then-finalize workflow. It is appropriate for a hiring exercise because the expensive or unreliable work is outside the HTTP request. A real payment integration would add payment authorization and compensation rules before using this pattern in production.
 
-- Zero infra. No Redis, no RabbitMQ. The brief asked for queue processing; the driver is an implementation detail.
-- Every queued job is a row in the `jobs` table, which makes **manual inspection trivial** during grading (`SELECT * FROM jobs`).
-- In production: change `QUEUE_CONNECTION=redis` and zero code changes are needed. Laravel's queue contract is identical across drivers.
+## 7. Mystery discount
 
-### Why a separate job (`ProcessOrder`)?
+The configured default distribution is:
 
-Two-step intent:
+| Result       | Probability |
+| ------------ | ----------: |
+| No discount  |         75% |
+| 10% discount |         20% |
+| 50% discount |          5% |
 
-1. **Synchronously** — the `POST /api/purchase` endpoint *reserves* the order (`status = PROCESSING`) and returns a `202`-style response with the order ID. The user gets immediate feedback.
-2. **Asynchronously** — the `worker` container picks the job off the queue, generates an invoice, and marks the order `COMPLETED`.
+`DiscountService` reads the weights from `config/purchase.php`, selects a bucket with `random_int()`, and calculates the payable amount before the order is stored. The order keeps both the percentage and final amount, so the value cannot change later when the queue runs.
 
-This split is the textbook **reserve-then-finalize** pattern. It also gives us a natural failure point: if invoice generation fails, the job's `failed()` handler marks the order `FAILED`, and Laravel's `jobs` table records the exception payload for inspection. The customer-side HTTP call already succeeded, but the order is now flagged for ops triage.
+Money is stored in MySQL decimal columns and returned to clients as integer cents. This avoids asking JavaScript clients to perform floating-point currency arithmetic.
 
-### Why do we dispatch the job *inside* the transaction?
+## 8. Activity logging
 
-If the transaction commits but the `dispatch()` fails (rare, but possible), we lose the job. By dispatching inside the transaction, the job is enqueued only **after** the COMMIT. If anything throws before commit, no job is enqueued and the order row is rolled back — atomicity guaranteed.
+Every service-level purchase attempt produces one activity row:
 
----
+- email
+- SKU
+- quantity
+- success or failed status
+- failure reason when applicable
+- Laravel timestamps
 
-## 6. Discounts: Why a Weighted Random Roll, and Why 75/20/5?
+Successful logs are written after the order is accepted. Known product, stock, cooldown, and unexpected failures are logged before the exception reaches the controller.
 
-### What we ship
+The activity log is intentionally explicit rather than hidden in a model observer. A reviewer can follow the complete purchase path in one service class.
 
-```php
-public function roll(): int
-{
-    $weights = config('purchase.discount_weights'); // [0=>75, 10=>20, 50=>5]
-    $total   = array_sum($weights);
-    $pick    = random_int(1, $total); // 1..100
-    $cursor  = 0;
-    foreach ($weights as $percent => $weight) {
-        $cursor += $weight;
-        if ($pick <= $cursor) {
-            return $percent;
-        }
-    }
-    return array_key_first($weights); // unreachable
-}
-```
+## 9. API and Blade boundaries
 
-### Why weighted random?
+The API is versioned under `/api/v1` so future changes can be introduced without silently changing an existing client contract.
 
-- The brief said "mystery discount" — a *random* perk. A weighted distribution lets us tune the customer-facing experience (rare = exciting) without changing code paths.
-- `random_int()` is **cryptographically secure** (uses `random_bytes`); `mt_rand()` is fast but predictable. For a demo, either is fine; `random_int` is one extra zero in the cost column.
+Public API endpoints expose the active catalogue and health probes. Sanctum protects orders and purchases. Blade routes handle product administration because the challenge asks for CRUD but does not require an admin API.
 
-### Why 75/20/5?
+In a larger product, the Blade CRUD routes should be placed behind an administrator role or policy. The current exercise keeps the CRUD surface intentionally small.
 
-- 75% no discount — the "normal" path. Most users shouldn't notice.
-- 20% off — the "win" path. Frequent enough that people feel lucky.
-- 5% off 50% — the "jackpot". Rare, memorable.
+## 10. Queue and operational choices
 
-These weights live in `config/purchase.php` and can be overridden via env vars (`PURCHASE_DISCOUNT_WEIGHT_FIFTY=10` makes the jackpot 10%). Empirically, rolling 100 times produced 79 / 18 / 3 — within 5% of the expected 75 / 20 / 5.
+The queue uses Redis in Docker because it provides fast worker throughput and is already needed for distributed locks. The job has explicit connection and queue settings, retry attempts, backoff, timeout, and a retry deadline.
 
-### Why compute the discount at *attempt* time, not at *job* time?
+The Compose stack separates the HTTP app, worker, scheduler, MySQL, and Redis services. The PHP image is built from `docker/php/Dockerfile`, so a fresh clone does not depend on a pre-existing local image.
 
-Because the price the customer sees in the API response is the price they pay. If we discovered the discount in the queue worker, the API response would lie. By computing it synchronously and persisting it to the `orders` row, the response is honest and the queue worker only does bookkeeping (invoice generation, status flip).
+The readiness endpoint checks database and cache access before reporting the application as ready. Structured logs include correlation IDs so one request can be followed through the API and worker logs.
 
----
+## 11. Test strategy
 
-## 7. Custom Exceptions vs. Error Codes
+The test suite covers:
 
-Each domain failure maps to its own exception class:
+- Authentication and validation
+- Unknown products
+- Insufficient stock
+- Successful order creation
+- Queue completion in the synchronous test environment
+- Cooldown responses
+- Idempotent replay
+- Stock invariants under repeated contention
+- Discount distribution
 
-| Exception | HTTP code | Trigger |
-|---|---|---|
-| `ProductNotFoundException` | 404 | SKU does not exist |
-| `InactiveProductException` | 400 | Product status ≠ active |
-| `InsufficientStockException` | 400 | Atomic UPDATE affected 0 rows |
-| `PurchaseCooldownException` | 429 | Cooldown key present in cache |
+The Docker smoke script covers the deployed HTTP path: health, login, catalogue, purchase, idempotent replay, and order history.
 
-The controller's `try/catch` translates each one. This means:
-
-1. The service throws *semantic* exceptions — never generic `\RuntimeException`.
-2. The controller is the only place that knows about HTTP. Swap it for a CLI handler and you have a console-driven purchase flow with the same business rules.
-3. Adding a new rule = add a new exception class + one `catch` arm. No flag-string parsing, no magic integers.
-
----
-
-## 8. Eloquent vs. Query Builder vs. Raw SQL
-
-We use Eloquent for **read** paths (`Product::where('sku', $sku)->first()`) and the **Query Builder** for the atomic stock decrement. Eloquent is convenient for relationships and casting; the Query Builder is necessary for the conditional UPDATE because Eloquent's `update()` doesn't expose the `WHERE stock >= qty` predicate as a first-class method.
-
-Models still expose `Product::decrementStock(int $id, int $qty): bool` as a thin wrapper, so callers don't import `DB` directly. The wrapper uses `static::query()` (model class, not instance) so it bypasses any per-instance casts or observers and operates on raw columns.
-
----
-
-## 9. Activity Logging: One Row Per Attempt
-
-Every call to `PurchaseService::attempt` writes exactly one row to `activity_logs`:
-
-- `success` → row written with `status = SUCCESS`, includes order ID.
-- `failure` → row written with `status = FAILED`, includes the failure reason.
-
-The brief said "track who tried to buy what and when". One row per attempt satisfies that without exploding the table. Indexes on `(action, created_at)` and `(user_email, created_at)` keep queries fast even at 10⁶ rows.
-
-We log **inside the same transaction** as the order write — so a rollback removes the activity row too. There's no "phantom success" scenario where the log says SUCCESS but the order doesn't exist.
-
----
-
-## 10. Why Three Service Interfaces (and Two Concrete Services)?
-
-| Interface | Implementation | Used by |
-|---|---|---|
-| `PurchaseServiceInterface` | `PurchaseService` | Controller, simulation command, future tests |
-| `DiscountServiceInterface` | `DiscountService` | `PurchaseService` (via constructor injection) |
-
-`OrderServiceInterface` is referenced in the README but was not actually needed — order status updates are one-liners that live directly on the `Order` model. Adding an interface for a single method would be over-engineering. **The README has been corrected to remove this reference.**
-
----
-
-## 11. Things I Considered and Rejected
-
-1. **Sanctum / Passport for auth** — out of scope; `X-User-Email` is the assessment-grade answer.
-2. **Event sourcing for orders** — overkill. Eloquent + a `status` enum covers the state machine.
-3. **Redis everywhere** — not in the spec; the database driver is simpler to grade.
-4. **Sail** — extra abstraction layer; see §2.
-5. **Custom database-backed cooldown table** — cache TTLs are free; see §4.
-6. **`lockForUpdate()`** — pessimistic, throughput-bounded; see §3.
-7. **Per-row optimistic locking (`version` column)** — would work but adds boilerplate and doesn't beat the conditional UPDATE.
-8. **Event listeners for activity logging** — hidden control flow; explicit call inside the service is easier to audit.
-9. **Repository pattern (`ProductRepository`)** — would push Eloquent behind an abstraction that nobody benefits from in a Laravel app.
-10. **DTOs for *every* service method** — `PurchaseResult` is enough. `Order::find($id)` is fine for simple reads.
-
----
-
-## 12. Code-Quality Practices Observed
-
-- `declare(strict_types=1);` at the top of every PHP file in `app/`.
-- Typed properties and return types everywhere (`OrderStatus`, `Carbon`, `string`, `int`, `bool`).
-- PHP 8.1+ backed enums (`ProductStatus`, `OrderStatus`, `ActivityStatus`).
-- Readonly DTO (`PurchaseResult`) for service output.
-- Single responsibility per class — controllers handle HTTP, services handle domain, models handle persistence.
-- No fat controllers — `Api\PurchaseController` is 22 lines.
-- Idempotent smoke-test script (`migrate:fresh --seed` at the top).
-- All services, models, jobs, and commands pass `php -l` (no syntax errors).
-- All 8 smoke-test scenarios pass: 422, 400 (inactive), 404, 400 (stock), 200, 429, 200, 200.
-- Concurrency simulation verified: 1 success, 9 failures, zero overselling, stock decrement matches successful orders.
-
----
-
-## 13. What I'd Add Next, Given More Time
-
-| Priority | Item | Reason |
-|---|---|---|
-| High | **Pest / PHPUnit feature tests** for `PurchaseService` | Right now we have shell smoke tests; PHPUnit would test exception messages, return shapes, and partial states. |
-| High | **Lock the cooldown cache backend with `Cache::lock` for multi-instance web** | File cache is per-container. Multi-worker = use Redis. |
-| Medium | **`Idempotency-Key` header** on `POST /api/purchase` | Network retries currently could double-charge. Industry-standard mitigation. |
-| Medium | **Event broadcasting** (`OrderCompleted` event) | So other services (email, analytics) can subscribe without modifying `PurchaseService`. |
-| Low | **Rate limit per IP** in middleware | Cooldown is per-user; a hostile client could exhaust SKUs by rotating emails. |
-| Low | **`/api/orders/{id}` endpoint** | Customers have no way to fetch their invoice after `COMPLETED`. |
-| Low | **OpenAPI spec** | Hand-curated from the routes file; reviewers can `try it out` from Swagger UI. |
-
----
-
-## 14. Verifiability — How to Reproduce the Numbers
-
-```bash
-# Clone and bring the stack up
-git clone <repo-url>
-cd Flash_Sale_Inventor_System
-docker compose up -d
-docker compose exec app php artisan key:generate
-docker compose exec app php artisan migrate:fresh --seed
-docker compose exec app php artisan queue:work --tries=1 &   # or rely on `worker` container
-
-# 1. Smoke test (8/8 pass)
-bash tests/smoke-api.sh
-
-# 2. Concurrency simulation (10 users, 3 stock, qty=2 -> 1 wins)
-docker compose exec app php artisan purchase:simulate --sku=SKU-1001 --qty=2 --users=10 --stock=3 --reset
-
-# 3. Inspect the side-effects
-docker compose exec db mysql -uroot -proot flash_sale \
-  -e "SELECT sku, stock_quantity FROM products WHERE sku='SKU-1001';
-      SELECT COUNT(*) orders FROM orders WHERE sku='SKU-1001';
-      SELECT status, COUNT(*) FROM activity_logs GROUP BY status;"
-```
-
-Expected: stock = 1 (3 − 1×2), orders = 1, activity = (SUCCESS=1, FAILED=9).
+For a production readiness review, we need to add a multi-process load test, database deadlock retry metrics, queue latency metrics and administrator authorization.
